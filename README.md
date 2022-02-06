@@ -1,5 +1,11 @@
 # <h1 align="center"> foundry </h1>
 
+# THIS IS MY """FORK""" FOR USE AS A SUBMODULE
+# THIS IS MY """FORK""" FOR USE AS A SUBMODULE
+# THIS IS MY """FORK""" FOR USE AS A SUBMODULE
+it requires there is a ethers-rs submodule alongside it
+fixes errors where traits dont work due to our own dependecny and another version of that in the dependency of one of our dependecies
+
 ![Github Actions](https://github.com/gakonst/foundry/workflows/Tests/badge.svg)
 [![Telegram Chat][tg-badge]][tg-url]
 [![Crates.io][crates-badge]][crates-url]
