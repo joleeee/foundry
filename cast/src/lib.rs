@@ -79,7 +79,7 @@ where
         let (tx, func) = self
             .build_tx(from, to, Some(args), None, None, None, None, chain, etherscan_api_key, false)
             .await?;
-        let res = self.provider.call(&tx, block).await?;
+        let res = self.provider.call(&tx, block, None).await?;
 
         // decode args into tokens
         let func = func.expect("no valid function signature was provided.");
