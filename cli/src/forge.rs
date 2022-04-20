@@ -1,11 +1,11 @@
 pub mod cmd;
+pub mod compile;
 mod opts;
+mod term;
 mod utils;
 
-use crate::cmd::Cmd;
-
-use ethers::solc::{self, report::BasicStdoutReporter, Project, ProjectPathsConfig};
-use opts::forge::{Dependency, FullContractInfo, Opts, Subcommands};
+use crate::cmd::{forge::watch, Cmd};
+use opts::forge::{Dependency, Opts, Subcommands};
 use std::process::Command;
 
 use clap::{IntoApp, Parser};
@@ -14,27 +14,35 @@ use clap_complete::generate;
 fn main() -> eyre::Result<()> {
     color_eyre::install()?;
     utils::subscriber();
-    solc::report::init(BasicStdoutReporter::default());
 
     let opts = Opts::parse();
     match opts.sub {
         Subcommands::Test(cmd) => {
-            let outcome = cmd.run()?;
-            outcome.ensure_ok()?;
+            if cmd.is_watch() {
+                utils::block_on(watch::watch_test(cmd))?;
+            } else {
+                let outcome = cmd.run()?;
+                outcome.ensure_ok()?;
+            }
         }
         Subcommands::Bind(cmd) => {
             cmd.run()?;
         }
         Subcommands::Build(cmd) => {
-            cmd.run()?;
+            if cmd.is_watch() {
+                utils::block_on(crate::cmd::forge::watch::watch_build(cmd))?;
+            } else {
+                cmd.run()?;
+            }
         }
         Subcommands::Run(cmd) => {
             cmd.run()?;
         }
-        Subcommands::VerifyContract { contract, address, constructor_args } => {
-            let FullContractInfo { path, name } = contract;
-            let rt = tokio::runtime::Runtime::new().expect("could not start tokio rt");
-            rt.block_on(cmd::verify::run(path, name, address, constructor_args))?;
+        Subcommands::VerifyContract(args) => {
+            utils::block_on(args.run())?;
+        }
+        Subcommands::VerifyCheck(args) => {
+            utils::block_on(args.run())?;
         }
         Subcommands::Create(cmd) => {
             cmd.run()?;
@@ -65,16 +73,18 @@ fn main() -> eyre::Result<()> {
             cmd.run()?;
         }
         Subcommands::Completions { shell } => {
-            generate(shell, &mut Opts::into_app(), "forge", &mut std::io::stdout())
+            generate(shell, &mut Opts::command(), "forge", &mut std::io::stdout())
         }
         Subcommands::Clean { root } => {
-            let root = root.unwrap_or_else(|| std::env::current_dir().unwrap());
-            let paths = ProjectPathsConfig::builder().root(&root).build()?;
-            let project = Project::builder().paths(paths).build()?;
-            project.cleanup()?;
+            let config = utils::load_config_with_root(root);
+            config.project()?.cleanup()?;
         }
         Subcommands::Snapshot(cmd) => {
-            cmd.run()?;
+            if cmd.is_watch() {
+                utils::block_on(crate::cmd::forge::watch::watch_snapshot(cmd))?;
+            } else {
+                cmd.run()?;
+            }
         }
         // Subcommands::Fmt(cmd) => {
         //     cmd.run()?;
@@ -83,6 +93,12 @@ fn main() -> eyre::Result<()> {
             cmd.run()?;
         }
         Subcommands::Flatten(cmd) => {
+            cmd.run()?;
+        }
+        Subcommands::Inspect(cmd) => {
+            cmd.run()?;
+        }
+        Subcommands::Tree(cmd) => {
             cmd.run()?;
         }
     }
@@ -95,8 +111,9 @@ fn remove(root: impl AsRef<std::path::Path>, dependencies: Vec<Dependency>) -> e
     let git_mod_libs = std::path::Path::new(".git/modules/lib");
 
     dependencies.iter().try_for_each(|dep| -> eyre::Result<_> {
-        let path = libs.join(&dep.name);
-        let git_mod_path = git_mod_libs.join(&dep.name);
+        let target_dir = if let Some(alias) = &dep.alias { alias } else { &dep.name };
+        let path = libs.join(&target_dir);
+        let git_mod_path = git_mod_libs.join(&target_dir);
         println!("Removing {} in {:?}, (url: {}, tag: {:?})", dep.name, path, dep.url, dep.tag);
 
         // remove submodule entry from .git/config

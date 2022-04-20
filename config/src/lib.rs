@@ -1,29 +1,31 @@
 //! foundry configuration.
+#![deny(missing_docs, unsafe_code, unused_crate_dependencies)]
+
 use std::{
     borrow::Cow,
-    collections::BTreeMap,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
-use figment::{
-    providers::{Env, Format, Serialized, Toml},
-    value::{Dict, Map},
-    Error, Figment, Metadata, Profile, Provider,
-};
-// reexport so cli types can implement `figment::Provider` to easily merge compiler arguments
-pub use figment;
-use semver::Version;
-use serde::{Deserialize, Serialize};
-
+use crate::caching::StorageCachingConfig;
 use ethers_core::types::{Address, U256};
+pub use ethers_solc::artifacts::OptimizerDetails;
 use ethers_solc::{
-    artifacts::{Optimizer, OptimizerDetails, Settings},
+    artifacts::{output_selection::ContractOutputSelection, BytecodeHash, Optimizer, Settings},
+    cache::SOLIDITY_FILES_CACHE_FILENAME,
     error::SolcError,
     remappings::{RelativeRemapping, Remapping},
-    EvmVersion, Project, ProjectPathsConfig, SolcConfig,
+    ConfigurableArtifacts, EvmVersion, Project, ProjectPathsConfig, Solc, SolcConfig,
 };
-use figment::{providers::Data, value::Value};
+use eyre::{ContextCompat, WrapErr};
+use figment::{
+    providers::{Data, Env, Format, Serialized, Toml},
+    value::{Dict, Map, Value},
+    Error, Figment, Metadata, Profile, Provider,
+};
 use inflector::Inflector;
+use semver::Version;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 // Macros useful for creating a figment.
 mod macros;
@@ -31,6 +33,13 @@ mod macros;
 // Utilities for making it easier to handle tests.
 pub mod utils;
 pub use crate::utils::*;
+
+pub mod caching;
+mod chain;
+pub use chain::Chain;
+
+// reexport so cli types can implement `figment::Provider` to easily merge compiler arguments
+pub use figment;
 
 /// Foundry configuration
 ///
@@ -87,6 +96,8 @@ pub struct Config {
     pub libraries: Vec<String>,
     /// whether to enable cache
     pub cache: bool,
+    /// where the cache is stored if enabled
+    pub cache_path: PathBuf,
     /// whether to force a `project.clean()`
     pub force: bool,
     /// evm version to use
@@ -94,11 +105,14 @@ pub struct Config {
     pub evm_version: EvmVersion,
     /// list of contracts to report gas of
     pub gas_reports: Vec<String>,
-    /// Concrete solc version to use if any.
+    /// The Solc instance to use if any.
     ///
     /// This takes precedence over `auto_detect_solc`, if a version is set then this overrides
     /// auto-detection.
-    pub solc_version: Option<Version>,
+    ///
+    /// **Note** for backwards compatibility reasons this also accepts solc_version from the toml
+    /// file, see [`BackwardsCompatProvider`]
+    pub solc: Option<SolcReq>,
     /// whether to autodetect the solc compiler version to use
     pub auto_detect_solc: bool,
     /// Offline mode, if set, network access (downloading solc) is disallowed.
@@ -120,8 +134,10 @@ pub struct Config {
     pub verbosity: u8,
     /// url of the rpc server that should be used for any rpc calls
     pub eth_rpc_url: Option<String>,
-    /// list of solidity error codes to always silence
-    pub ignored_error_codes: Vec<u64>,
+    /// etherscan API key
+    pub etherscan_api_key: Option<String>,
+    /// list of solidity error codes to always silence in the compiler output
+    pub ignored_error_codes: Vec<SolidityErrorCode>,
     /// The number of test cases that must execute for each property test
     pub fuzz_runs: u32,
     /// Whether to allow ffi cheatcodes in test
@@ -139,7 +155,7 @@ pub struct Config {
     /// the chainid opcode value
     pub chain_id: Option<Chain>,
     /// Block gas limit
-    pub gas_limit: u64,
+    pub gas_limit: GasLimit,
     /// `tx.gasprice` value during EVM execution"
     pub gas_price: u64,
     /// the base fee in a block
@@ -151,27 +167,35 @@ pub struct Config {
     /// the `block.difficulty` value during EVM execution
     pub block_difficulty: u64,
     /// the `block.gaslimit` value during EVM execution
-    pub block_gas_limit: Option<u64>,
-    /// Pass extra output types
-    pub extra_output: Option<Vec<String>>,
-    /// Settings to pass to the `solc` compiler input
-    // TODO consider making this more structured https://stackoverflow.com/questions/48998034/does-toml-support-nested-arrays-of-objects-tables
-    // TODO this needs to work as extension to the defaults:
+    pub block_gas_limit: Option<GasLimit>,
+    /// The memory limit of the EVM (32 MB by default)
+    pub memory_limit: u64,
+    /// Additional output selection for all contracts
+    /// such as "ir", "devodc", "storageLayout", etc.
+    /// See [Solc Compiler Api](https://docs.soliditylang.org/en/latest/using-the-compiler.html#compiler-api)
+    ///
+    /// The following values are always set because they're required by `forge`
     //{
-    //   "*": {
-    //     "": [
-    //       "ast"
-    //     ],
-    //     "*": [
+    //   "*": [
     //       "abi",
     //       "evm.bytecode",
     //       "evm.deployedBytecode",
     //       "evm.methodIdentifiers"
     //     ]
-    //   }
     // }
     // "#
-    pub solc_settings: Option<String>,
+    #[serde(default)]
+    pub extra_output: Vec<ContractOutputSelection>,
+    /// If set , a separate `json` file will be emitted for every contract depending on the
+    /// selection, eg. `extra_output_files = ["metadata"]` will create a `metadata.json` for
+    /// each contract in the project. See [Contract Metadata](https://docs.soliditylang.org/en/latest/metadata.html)
+    ///
+    /// The difference between `extra_output = ["metadata"]` and
+    /// `extra_output_files = ["metadata]` is that the former will include the
+    /// contract's metadata in the contract's json artifact, whereas the latter will emit the
+    /// output selection as separate files.
+    #[serde(default)]
+    pub extra_output_files: Vec<ContractOutputSelection>,
     /// The maximum number of local test case rejections allowed
     /// by proptest, to be encountered during usage of `vm.assume`
     /// cheatcode.
@@ -180,6 +204,29 @@ pub struct Config {
     /// by proptest, to be encountered during usage of `vm.assume`
     /// cheatcode.
     pub fuzz_max_global_rejects: u32,
+    /// Print the names of the compiled contracts
+    pub names: bool,
+    /// Print the sizes of the compiled contracts
+    pub sizes: bool,
+    /// If set to true, changes compilation pipeline to go through the Yul intermediate
+    /// representation.
+    pub via_ir: bool,
+    /// RPC storage caching settings determines what chains and endpoints to cache
+    pub rpc_storage_caching: StorageCachingConfig,
+    /// Disables storage caching entirely. This overrides any settings made in
+    /// `rpc_storage_caching`
+    pub no_storage_caching: bool,
+    /// Whether to include the metadata hash.
+    ///
+    /// The metadata hash is machine dependent. By default, this is set to [BytecodeHash::None] to allow for deterministic code, See: <https://docs.soliditylang.org/en/latest/metadata.html>
+    #[serde(with = "from_str_lowercase")]
+    pub bytecode_hash: BytecodeHash,
+    /// Whether to compile in sparse mode
+    ///
+    /// If this option is enabled, only the required contracts/files will be selected to be
+    /// included in solc's output selection, see also
+    /// [OutputSelection](ethers_solc::artifacts::output_selection::OutputSelection)
+    pub sparse_mode: bool,
     /// The root path where the config detection started from, `Config::with_root`
     #[doc(hidden)]
     //  We're skipping serialization here, so it won't be included in the [`Config::to_string()`]
@@ -320,6 +367,8 @@ impl Config {
         self.remappings =
             self.remappings.into_iter().map(|r| RelativeRemapping::new(r.into(), &root)).collect();
 
+        self.cache_path = p(&root, &self.cache_path);
+
         self
     }
 
@@ -365,13 +414,14 @@ impl Config {
     }
 
     fn create_project(&self, cached: bool, no_artifacts: bool) -> Result<Project, SolcError> {
-        let project = Project::builder()
+        let mut project = Project::builder()
+            .artifacts(self.configured_artifacts_handler())
             .paths(self.project_paths())
             .allowed_path(&self.__root.0)
             .allowed_paths(&self.libs)
             .solc_config(SolcConfig::builder().settings(self.solc_settings()?).build())
-            .ignore_error_codes(self.ignored_error_codes.clone())
-            .set_auto_detect(self.auto_detect_solc)
+            .ignore_error_codes(self.ignored_error_codes.iter().copied().map(Into::into))
+            .set_auto_detect(self.is_auto_detect())
             .set_offline(self.offline)
             .set_cached(cached)
             .set_no_artifacts(no_artifacts)
@@ -381,7 +431,56 @@ impl Config {
             project.cleanup()?;
         }
 
+        if let Some(solc) = self.ensure_solc()? {
+            project.solc = solc;
+        }
+
         Ok(project)
+    }
+
+    /// Ensures that the configured version is installed if explicitly set
+    ///
+    /// If `solc` is [`SolcReq::Version`] then this will download and install the solc version if
+    /// it's missing.
+    ///
+    /// If `solc` is [`SolcReq::Local`] then this will ensure that the path exists.
+    fn ensure_solc(&self) -> Result<Option<Solc>, SolcError> {
+        if let Some(ref solc) = self.solc {
+            let solc = match solc {
+                SolcReq::Version(version) => {
+                    let v = version.to_string();
+                    let mut solc = Solc::find_svm_installed_version(&v)?;
+                    if solc.is_none() {
+                        Solc::blocking_install(version)?;
+                        solc = Solc::find_svm_installed_version(&v)?;
+                    }
+                    solc
+                }
+                SolcReq::Local(solc) => {
+                    if !solc.is_file() {
+                        return Err(SolcError::msg(format!(
+                            "`solc` {} does not exist",
+                            solc.display()
+                        )))
+                    }
+                    Some(Solc::new(solc))
+                }
+            };
+            return Ok(solc)
+        }
+
+        Ok(None)
+    }
+
+    /// Returns whether the compiler version should be auto-detected
+    ///
+    /// Returns `false` if `solc_version` is explicitly set, otherwise returns the value of
+    /// `auto_detect_solc`
+    pub fn is_auto_detect(&self) -> bool {
+        if self.solc.is_some() {
+            return false
+        }
+        self.auto_detect_solc
     }
 
     /// Returns the `ProjectPathsConfig`  sub set of the config.
@@ -398,11 +497,46 @@ impl Config {
     /// ```
     pub fn project_paths(&self) -> ProjectPathsConfig {
         ProjectPathsConfig::builder()
+            .cache(&self.cache_path.join(SOLIDITY_FILES_CACHE_FILENAME))
             .sources(&self.src)
+            .tests(&self.test)
             .artifacts(&self.out)
             .libs(self.libs.clone())
-            .remappings(self.remappings.iter().map(|m| m.clone().into()))
+            .remappings(self.get_all_remappings())
             .build_with_root(&self.__root.0)
+    }
+
+    /// Returns all configured [`Remappings`]
+    ///
+    /// **Note:** this will add an additional `<src>/=<src path>` remapping here so imports that
+    /// look like `import {Foo} from "src/Foo.sol";` are properly resolved.
+    ///
+    /// This is due the fact that `solc`'s VFS resolves [direct imports](https://docs.soliditylang.org/en/develop/path-resolution.html#direct-imports) that start with the source directory's name.
+    ///
+    /// So that
+    ///
+    /// ```solidity
+    /// import "./math/math.sol";
+    /// import "contracts/tokens/token.sol";
+    /// ```
+    ///
+    /// in `contracts/contract.sol` are resolved to
+    ///
+    /// ```text
+    /// contracts/tokens/token.sol
+    /// contracts/math/math.sol
+    /// ```
+    pub fn get_all_remappings(&self) -> Vec<Remapping> {
+        let mut remappings: Vec<_> = self.remappings.iter().map(|m| m.clone().into()).collect();
+        if let Some(src_dir_name) =
+            self.src.file_name().and_then(|s| s.to_str()).filter(|s| !s.is_empty())
+        {
+            remappings.push(Remapping {
+                name: format!("{src_dir_name}/"),
+                path: format!("{}", self.src.display()),
+            });
+        }
+        remappings
     }
 
     /// Returns the `Optimizer` based on the configured settings
@@ -414,18 +548,10 @@ impl Config {
         }
     }
 
-    pub fn output_selection(&self) -> BTreeMap<String, BTreeMap<String, Vec<String>>> {
-        let mut output_selection = Settings::default_output_selection();
-
-        if let Some(extras) = &self.extra_output {
-            output_selection.entry("*".to_string()).and_modify(|e1| {
-                e1.entry("*".to_string()).and_modify(|e2| {
-                    e2.extend_from_slice(extras.as_slice());
-                });
-            });
-        }
-
-        output_selection
+    /// returns the [`ethers_solc::ConfigurableArtifacts`] for this config, that includes the
+    /// `extra_output` fields
+    pub fn configured_artifacts_handler(&self) -> ConfigurableArtifacts {
+        ConfigurableArtifacts::new(self.extra_output.clone(), self.extra_output_files.clone())
     }
 
     /// Returns the configured `solc` `Settings` that includes:
@@ -435,16 +561,22 @@ impl Config {
     pub fn solc_settings(&self) -> Result<Settings, SolcError> {
         let libraries = parse_libraries(&self.libraries)?;
         let optimizer = self.optimizer();
-        let output_selection = self.output_selection();
 
-        Ok((Settings {
+        let mut settings = Settings {
             optimizer,
             evm_version: Some(self.evm_version),
             libraries,
-            output_selection,
+            metadata: Some(self.bytecode_hash.into()),
             ..Default::default()
-        })
-        .with_ast())
+        }
+        .with_extra_output(self.configured_artifacts_handler().output_selection())
+        .with_ast();
+
+        if self.via_ir {
+            settings = settings.with_via_ir();
+        }
+
+        Ok(settings)
     }
 
     /// Returns the default figment
@@ -559,7 +691,19 @@ impl Config {
     pub fn to_string_pretty(&self) -> Result<String, toml::ser::Error> {
         // serializing to value first to prevent `ValueAfterTable` errors
         let value = toml::Value::try_from(self)?;
-        let s = toml::to_string_pretty(&value)?;
+        let mut s = toml::to_string_pretty(&value)?;
+
+        if self.optimizer_details.is_some() {
+            // this is a hack to make nested tables work because this requires the config's profile
+            s = s
+                .replace("[optimizer_details]", &format!("[{}.optimizer_details]", self.profile))
+                .replace(
+                    "[optimizer_details.yulDetails]",
+                    &format!("[{}.optimizer_details.yulDetails]", self.profile),
+                );
+        }
+        s = s.replace("[rpc_storage_caching]", &format!("[{}.rpc_storage_caching]", self.profile));
+
         Ok(format!(
             r#"[{}]
 {}"#,
@@ -582,6 +726,40 @@ impl Config {
     /// Returns the path to foundry's config dir `~/.foundry/`
     pub fn foundry_dir() -> Option<PathBuf> {
         dirs_next::home_dir().map(|p| p.join(Config::FOUNDRY_DIR_NAME))
+    }
+
+    /// Returns the path to foundry's cache dir `~/.foundry/cache`
+    pub fn foundry_cache_dir() -> Option<PathBuf> {
+        Self::foundry_dir().map(|p| p.join("cache"))
+    }
+
+    /// Returns the path to foundry's etherscan cache dir `~/.foundry/cache/<chain>/etherscan`
+    pub fn foundry_etherscan_cache_dir(chain_id: impl Into<Chain>) -> Option<PathBuf> {
+        Some(Self::foundry_cache_dir()?.join(chain_id.into().to_string()).join("etherscan"))
+    }
+
+    /// Returns the path to the cache file of the `block` on the `chain`
+    /// `~/.foundry/cache/<chain>/<block>/storage.json`
+    pub fn foundry_block_cache_file(chain_id: impl Into<Chain>, block: u64) -> Option<PathBuf> {
+        Some(
+            Config::foundry_cache_dir()?
+                .join(chain_id.into().to_string())
+                .join(format!("{block}"))
+                .join("storage.json"),
+        )
+    }
+
+    #[doc = r#"Returns the path to `foundry`'s data directory inside the user's data directory
+    |Platform | Value                                 | Example                          |
+    | ------- | ------------------------------------- | -------------------------------- |
+    | Linux   | `$XDG_CONFIG_HOME` or `$HOME`/.config/foundry | /home/alice/.config/foundry|
+    | macOS   | `$HOME`/Library/Application Support/foundry   | /Users/Alice/Library/Application Support/foundry |
+    | Windows | `{FOLDERID_RoamingAppData}/foundry`           | C:\Users\Alice\AppData\Roaming/foundry   |
+    "#]
+    pub fn data_dir() -> eyre::Result<PathBuf> {
+        let path = dirs_next::data_dir().wrap_err("Failed to find data directory")?.join("foundry");
+        std::fs::create_dir_all(&path).wrap_err("Failed to create module directory")?;
+        Ok(path)
     }
 
     /// Returns the path to the `foundry.toml` file, the file is searched for in
@@ -620,16 +798,19 @@ impl From<Config> for Figment {
 
         // check global foundry.toml file
         if let Some(global_toml) = Config::foundry_dir_toml().filter(|p| p.exists()) {
-            figment = figment.merge(ForcedSnakeCaseData(Toml::file(global_toml).nested()))
+            figment = figment.merge(BackwardsCompatProvider(ForcedSnakeCaseData(
+                Toml::file(global_toml).nested(),
+            )))
         }
 
         figment = figment
-            .merge(ForcedSnakeCaseData(
+            .merge(BackwardsCompatProvider(ForcedSnakeCaseData(
                 Toml::file(Env::var_or("FOUNDRY_CONFIG", Config::FILE_NAME)).nested(),
-            ))
+            )))
             .merge(Env::prefixed("DAPP_").ignore(&["REMAPPINGS", "LIBRARIES"]).global())
-            .merge(Env::prefixed("DAPP_TEST_").global())
+            .merge(Env::prefixed("DAPP_TEST_").ignore(&["CACHE"]).global())
             .merge(DappEnvCompatProvider)
+            .merge(Env::raw().only(&["ETHERSCAN_API_KEY"]))
             .merge(
                 Env::prefixed("FOUNDRY_").ignore(&["PROFILE", "REMAPPINGS", "LIBRARIES"]).global(),
             )
@@ -715,17 +896,20 @@ impl Default for Config {
             out: "out".into(),
             libs: vec!["lib".into()],
             cache: true,
+            cache_path: "cache".into(),
             force: false,
             evm_version: Default::default(),
             gas_reports: vec!["*".to_string()],
-            solc_version: None,
+            solc: None,
             auto_detect_solc: true,
             offline: false,
             optimizer: true,
             optimizer_runs: 200,
             optimizer_details: None,
-            extra_output: None,
-            solc_settings: None,
+            extra_output: Default::default(),
+            extra_output_files: Default::default(),
+            names: false,
+            sizes: false,
             fuzz_runs: 256,
             fuzz_max_local_rejects: 1024,
             fuzz_max_global_rejects: 65536,
@@ -736,21 +920,163 @@ impl Default for Config {
             block_number: 0,
             fork_block_number: None,
             chain_id: None,
-            // toml-rs can't handle larger number because integers are stored signed
-            // https://github.com/alexcrichton/toml-rs/issues/256
-            gas_limit: i64::MAX as u64,
+            gas_limit: i64::MAX.into(),
             gas_price: 0,
             block_base_fee_per_gas: 0,
             block_coinbase: Address::zero(),
             block_timestamp: 0,
             block_difficulty: 0,
             block_gas_limit: None,
+            memory_limit: 2u64.pow(25),
             eth_rpc_url: None,
+            etherscan_api_key: None,
             verbosity: 0,
             remappings: vec![],
             libraries: vec![],
-            ignored_error_codes: vec![],
+            ignored_error_codes: vec![SolidityErrorCode::SpdxLicenseNotProvided],
             __non_exhaustive: (),
+            via_ir: false,
+            rpc_storage_caching: Default::default(),
+            no_storage_caching: false,
+            bytecode_hash: BytecodeHash::Ipfs,
+            sparse_mode: false,
+        }
+    }
+}
+
+/// Wrapper for the config's `gas_limit` value necessary because toml-rs can't handle larger number because integers are stored signed: <https://github.com/alexcrichton/toml-rs/issues/256>
+///
+/// Due to this limitation this type will be serialized/deserialized as String if it's larger than
+/// `i64`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GasLimit(pub u64);
+
+impl From<u64> for GasLimit {
+    fn from(gas: u64) -> Self {
+        Self(gas)
+    }
+}
+impl From<i64> for GasLimit {
+    fn from(gas: i64) -> Self {
+        Self(gas as u64)
+    }
+}
+impl From<i32> for GasLimit {
+    fn from(gas: i32) -> Self {
+        Self(gas as u64)
+    }
+}
+impl From<u32> for GasLimit {
+    fn from(gas: u32) -> Self {
+        Self(gas as u64)
+    }
+}
+
+impl From<GasLimit> for u64 {
+    fn from(gas: GasLimit) -> Self {
+        gas.0
+    }
+}
+
+impl Serialize for GasLimit {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if self.0 > i64::MAX as u64 {
+            serializer.serialize_str(&self.0.to_string())
+        } else {
+            serializer.serialize_u64(self.0)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for GasLimit {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Gas {
+            Number(u64),
+            Text(String),
+        }
+
+        let gas = match Gas::deserialize(deserializer)? {
+            Gas::Number(num) => GasLimit(num),
+            Gas::Text(s) => GasLimit(s.parse().map_err(D::Error::custom)?),
+        };
+
+        Ok(gas)
+    }
+}
+
+/// A non-exhaustive list of solidity error codes
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SolidityErrorCode {
+    /// Warning that SPDX license identifier not provided in source file
+    SpdxLicenseNotProvided,
+    /// All other error codes
+    Other(u64),
+}
+
+impl From<SolidityErrorCode> for u64 {
+    fn from(code: SolidityErrorCode) -> u64 {
+        match code {
+            SolidityErrorCode::SpdxLicenseNotProvided => 1878,
+            SolidityErrorCode::Other(code) => code,
+        }
+    }
+}
+
+impl From<u64> for SolidityErrorCode {
+    fn from(code: u64) -> Self {
+        match code {
+            1878 => SolidityErrorCode::SpdxLicenseNotProvided,
+            other => SolidityErrorCode::Other(other),
+        }
+    }
+}
+
+impl Serialize for SolidityErrorCode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u64((*self).into())
+    }
+}
+
+impl<'de> Deserialize<'de> for SolidityErrorCode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        u64::deserialize(deserializer).map(Into::into)
+    }
+}
+
+/// Variants for selecting the [`Solc`] instance
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SolcReq {
+    /// Requires a specific solc version, that's either already installed (via `svm`) or will be
+    /// auto installed (via `svm`)
+    Version(Version),
+    /// Path to an existing local solc installation
+    Local(PathBuf),
+}
+
+impl<T: AsRef<str>> From<T> for SolcReq {
+    fn from(s: T) -> Self {
+        let s = s.as_ref();
+        if let Ok(v) = Version::from_str(s) {
+            SolcReq::Version(v)
+        } else {
+            SolcReq::Local(s.into())
         }
     }
 }
@@ -767,6 +1093,26 @@ impl<F: Format> Provider for ForcedSnakeCaseData<F> {
         let mut map = Map::new();
         for (profile, dict) in self.0.data()? {
             map.insert(profile, dict.into_iter().map(|(k, v)| (k.to_snake_case(), v)).collect());
+        }
+        Ok(map)
+    }
+}
+
+/// A Provider that handles breaking changes
+struct BackwardsCompatProvider<P>(P);
+
+impl<P: Provider> Provider for BackwardsCompatProvider<P> {
+    fn metadata(&self) -> Metadata {
+        Metadata::named("Backwards compat provider")
+    }
+
+    fn data(&self) -> Result<Map<Profile, Dict>, Error> {
+        let mut map = Map::new();
+        for (profile, mut dict) in self.0.data()? {
+            if let Some(v) = dict.remove("solc_version") {
+                dict.insert("solc".to_string(), v);
+            }
+            map.insert(profile, dict);
         }
         Ok(map)
     }
@@ -996,6 +1342,7 @@ impl<'a> Provider for RemappingsProvider<'a> {
 /// ```
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct BasicConfig {
+    /// the profile tag: `[default]`
     #[serde(skip)]
     pub profile: Profile,
     /// path of the source contracts dir, like `src` or `contracts`
@@ -1024,16 +1371,7 @@ impl BasicConfig {
     }
 }
 
-/// Either a named or chain id or the actual id value
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Chain {
-    #[serde(with = "from_str_lowercase")]
-    Named(ethers_core::types::Chain),
-    Id(u64),
-}
-
-mod from_str_lowercase {
+pub(crate) mod from_str_lowercase {
     use std::str::FromStr;
 
     use serde::{Deserialize, Deserializer, Serializer};
@@ -1056,15 +1394,6 @@ mod from_str_lowercase {
     }
 }
 
-impl From<Chain> for u64 {
-    fn from(c: Chain) -> Self {
-        match c {
-            Chain::Named(c) => c as u64,
-            Chain::Id(id) => id,
-        }
-    }
-}
-
 fn canonic(path: impl Into<PathBuf>) -> PathBuf {
     let path = path.into();
     ethers_solc::utils::canonicalize(&path).unwrap_or(path)
@@ -1076,6 +1405,7 @@ mod tests {
     use figment::error::Kind::InvalidType;
     use std::str::FromStr;
 
+    use crate::caching::{CachedChains, CachedEndpoints};
     use figment::{value::Value, Figment};
     use pretty_assertions::assert_eq;
 
@@ -1114,6 +1444,48 @@ mod tests {
             jail.set_env("FOUNDRY_PROFILE", "hardhat");
             let figment: Figment = Config::hardhat().into();
             assert_eq!(figment.profile(), "hardhat");
+
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [default]
+                libs = ['lib']
+                [local]
+                libs = ['modules']
+            "#,
+            )?;
+            jail.set_env("FOUNDRY_PROFILE", "local");
+            let config = Config::load();
+            assert_eq!(config.libs, vec![PathBuf::from("modules")]);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_default_test_path() {
+        figment::Jail::expect_with(|_| {
+            let config = Config::default();
+            let paths_config = config.project_paths();
+            assert_eq!(paths_config.tests, PathBuf::from(r"test"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_custom_test_path() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [default]
+                test = "mytest"
+            "#,
+            )?;
+
+            let config = Config::load();
+            let paths_config = config.project_paths();
+            assert_eq!(paths_config.tests, PathBuf::from(r"mytest"));
             Ok(())
         });
     }
@@ -1218,6 +1590,39 @@ mod tests {
                 ],
             );
 
+            // contains additional remapping to the source dir
+            assert_eq!(
+                config.get_all_remappings(),
+                vec![
+                    Remapping::from_str("ds-test/=lib/ds-test/src/").unwrap(),
+                    Remapping::from_str("env-lib/=lib/env-lib/").unwrap(),
+                    Remapping::from_str("other/=lib/other/").unwrap(),
+                    Remapping::from_str("some-source/=some-source").unwrap(),
+                ],
+            );
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_large_gas_limit() {
+        figment::Jail::expect_with(|jail| {
+            let gas = u64::MAX;
+            jail.create_file(
+                "foundry.toml",
+                &format!(
+                    r#"
+                [default]
+                gas_limit = "{}"
+            "#,
+                    gas
+                ),
+            )?;
+
+            let config = Config::load();
+            assert_eq!(config, Config { gas_limit: gas.into(), ..Config::default() });
+
             Ok(())
         });
     }
@@ -1235,6 +1640,9 @@ mod tests {
                 eth_rpc_url = "https://example.com/"
                 verbosity = 3
                 remappings = ["ds-test=lib/ds-test/"]
+                via_ir = true
+                rpc_storage_caching = { chains = [1, "optimism", 999999], endpoints = "all"}
+                bytecode_hash = "ipfs"
             "#,
             )?;
 
@@ -1248,9 +1656,59 @@ mod tests {
                     eth_rpc_url: Some("https://example.com/".to_string()),
                     remappings: vec![Remapping::from_str("ds-test=lib/ds-test/").unwrap().into()],
                     verbosity: 3,
+                    via_ir: true,
+                    rpc_storage_caching: StorageCachingConfig {
+                        chains: CachedChains::Chains(vec![
+                            Chain::Named(ethers_core::types::Chain::Mainnet),
+                            Chain::Named(ethers_core::types::Chain::Optimism),
+                            Chain::Id(999999)
+                        ]),
+                        endpoints: CachedEndpoints::All
+                    },
+                    bytecode_hash: BytecodeHash::Ipfs,
                     ..Config::default()
                 }
             );
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_solc_req() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [default]
+                solc_version = "0.8.12"
+            "#,
+            )?;
+
+            let config = Config::load();
+            assert_eq!(config.solc, Some(SolcReq::Version("0.8.12".parse().unwrap())));
+
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [default]
+                solc = "0.8.12"
+            "#,
+            )?;
+
+            let config = Config::load();
+            assert_eq!(config.solc, Some(SolcReq::Version("0.8.12".parse().unwrap())));
+
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [default]
+                solc = "path/to/local/solc"
+            "#,
+            )?;
+
+            let config = Config::load();
+            assert_eq!(config.solc, Some(SolcReq::Local("path/to/local/solc".into())));
 
             Ok(())
         });
@@ -1285,6 +1743,30 @@ mod tests {
                     ..Config::default()
                 }
             );
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_output_selection() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [default]
+                extra_output = ["metadata", "ir-optimized"]
+                extra_output_files = ["metadata"]
+            "#,
+            )?;
+
+            let config = Config::load();
+
+            assert_eq!(
+                config.extra_output,
+                vec![ContractOutputSelection::Metadata, ContractOutputSelection::IrOptimized]
+            );
+            assert_eq!(config.extra_output_files, vec![ContractOutputSelection::Metadata]);
 
             Ok(())
         });
@@ -1417,6 +1899,18 @@ mod tests {
                 vec!["src/DssSpell.sol:DssExecLib:0x8De6DDbCd5053d32292AAA0D2105A32d108484a6"
                     .to_string()]
             );
+
+            jail.set_env(
+                "DAPP_LIBRARIES",
+                "src/DssSpell.sol:DssExecLib:0x8De6DDbCd5053d32292AAA0D2105A32d108484a6",
+            );
+            let config = Config::load();
+            assert_eq!(
+                config.libraries,
+                vec!["src/DssSpell.sol:DssExecLib:0x8De6DDbCd5053d32292AAA0D2105A32d108484a6"
+                    .to_string(),]
+            );
+
             jail.set_env(
                 "DAPP_LIBRARIES",
                 "src/DssSpell.sol:DssExecLib:0x8De6DDbCd5053d32292AAA0D2105A32d108484a6,src/DssSpell.sol:DssExecLib:0x8De6DDbCd5053d32292AAA0D2105A32d108484a6",
@@ -1452,6 +1946,45 @@ mod tests {
             jail.create_file("foundry.toml", &default.to_string_pretty().unwrap())?;
             let other = Config::load();
             assert_eq!(default, other);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_optimizer_settings_basic() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [default]
+                optimizer = true
+
+                [default.optimizer_details]
+                yul = false
+
+                [default.optimizer_details.yulDetails]
+                stackAllocation = true
+            "#,
+            )?;
+            let loaded = Config::load();
+            assert_eq!(
+                loaded.optimizer_details,
+                Some(OptimizerDetails {
+                    yul: Some(false),
+                    yul_details: Some(YulDetails {
+                        stack_allocation: Some(true),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+            );
+
+            let s = loaded.to_string_pretty().unwrap();
+            jail.create_file("foundry.toml", &s)?;
+
+            let reloaded = Config::load();
+            assert_eq!(loaded, reloaded);
 
             Ok(())
         });

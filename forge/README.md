@@ -11,7 +11,7 @@ For more context on how the package works under the hood, look in the
 
 **Need help with Forge? Read the [📖 Foundry Book (Forge Guide)][foundry-book-forge-guide] (WIP)!**
 
-[foundry-book-forge-guide]: https://onbjerg.github.io/foundry-book/forge/
+[foundry-book-forge-guide]: https://book.getfoundry.sh/forge/
 
 ## Why?
 
@@ -100,6 +100,17 @@ function testDoubleWithFuzzing(uint256 x) public {
 - [ ] debug
 - [x] CLI Tracing with `RUST_LOG=forge=trace`
 
+### Gas Report
+
+Foundry will show you a comprehensive gas report about your contracts. It returns the `min`, `average`, `median` and, `max` gas cost for every function. 
+
+It looks at **all** the tests that make a call to a given function and records the associated gas costs. For example, if something calls a function and it reverts, that's propably the `min` value. Another example is the `max` value that is generated usually during the first call of the function (as it has to initialise storage, variables, etc.)
+
+Usually, the `median` value is what your users will probably end up paying. `max` and `min` concern edge cases that you might want to explicitly test against, but users will probably never encounter.
+
+<img width="626" alt="image" src="https://user-images.githubusercontent.com/13405632/155415392-3ef61d67-8952-40e1-a509-24a8bf18fa80.png">
+
+
 ### Cheat codes
 
 _The below is modified from
@@ -130,7 +141,7 @@ which implements the following methods:
 - `function ffi(string[] calldata) external returns (bytes memory)` Executes the
   arguments as a command in the system shell and returns stdout. Note that this
   cheatcode means test authors can execute arbitrary code on user machines as
-  part of a call to `dapp test`, for this reason all calls to `ffi` will fail
+  part of a call to `forge test`, for this reason all calls to `ffi` will fail
   unless the `--ffi` flag is passed.
 
 - `function deal(address who, uint256 amount)`: Sets an account's balance
@@ -152,6 +163,18 @@ which implements the following methods:
   Tells the evm to expect that the next call reverts with specified error bytes. Valid input types: `bytes`, and `bytes4`. Implicitly, strings get converted to bytes except when shorter than 4, in which case you will need to cast explicitly to `bytes`.
   
 - `function expectEmit(bool,bool,bool,bool) external`: Expects the next emitted event. Params check topic 1, topic 2, topic 3 and data are the same.
+
+- `function getCode(string calldata) external returns (bytes memory)`: Fetches bytecode from a contract artifact. The parameter can either be in the form `ContractFile.sol` (if the filename and contract name are the same), `ContractFile.sol:ContractName`, or `./path/to/artifact.json`.
+
+- `function label(address addr, string calldata label) external`: Label an address in test traces.
+
+- `function assume(bool) external`: When fuzzing, generate new inputs if conditional not met
+
+- `function setNonce(address account, uint64 nonce) external`: Set nonce for an account, increment only.
+
+- `function getNonce(address account)`: Get nonce for an account.
+
+- `function chainId(uint x) public` Sets the block chainid to `x`.
 
 The below example uses the `warp` cheatcode to override the timestamp & `expectRevert` to expect a specific revert string:
 
@@ -251,6 +274,7 @@ interface Hevm {
     // Sets an address' code, (who, newCode)
     function etch(address, bytes calldata) external;
     // Expects an error on next call
+    function expectRevert() external;
     function expectRevert(bytes calldata) external;
     function expectRevert(bytes4) external;
     // Record all storage reads and writes
@@ -271,8 +295,16 @@ interface Hevm {
     // Expect a call to an address with the specified calldata.
     // Calldata can either be strict or a partial match
     function expectCall(address,bytes calldata) external;
-
+    // Fetches the contract bytecode from its artifact file
     function getCode(string calldata) external returns (bytes memory);
+    // Label an address in test traces
+    function label(address addr, string calldata label) external;
+    // When fuzzing, generate new inputs if conditional not met
+    function assume(bool) external;
+    // Set nonce for an account, increment only
+    function setNonce(address,uint64) external;
+    // Get nonce for an account
+    function getNonce(address) external returns(uint64);
 }
 ```
 ### `console.log`
@@ -282,7 +314,7 @@ We support the logging functionality from Hardhat's `console.log`.
 
 If you are on a hardhat project, `import hardhat/console.sol` should just work if you use `forge test --hh`.
 
-If no, there is an implementation contract [here](https://github.com/gakonst/foundry/blob/master/evm-adapters/testdata/console.sol). We currently recommend that you copy this contract, place it in your `test` folder, and import it into the contract where you wish to use `console.log`, though there should be more streamlined functionality soon.
+If no, there is an implementation contract [here](https://raw.githubusercontent.com/NomicFoundation/hardhat/master/packages/hardhat-core/console.sol). We currently recommend that you copy this contract, place it in your `test` folder, and import it into the contract where you wish to use `console.log`, though there should be more streamlined functionality soon.
 
 Usage follows the same format as [Hardhat](https://hardhat.org/hardhat-network/reference/#console-log):
 ```solidity
@@ -290,6 +322,16 @@ import "./console.sol";
 ...
 console.log(someValue);
 
+```
+
+Note: to make logs visible in `stdout`, you must use at least level 2 verbosity.
+```bash
+$> forge test -vv
+[PASS] test1() (gas: 7683)
+...
+Logs:
+  <your log string or event>
+  ...
 ```
 
 ## Remappings
@@ -345,9 +387,9 @@ We also intend to add features which are not available in dapptools:
 1. Declarative deployment system based on a config file
 1. Formatting & Linting (maybe powered by
    [Solang](https://github.com/hyperledger-labs/solang))
-   1. `dapp fmt`, an automatic code formatter according to standard rules (like
+   1. `forge fmt`, an automatic code formatter according to standard rules (like
       [`prettier-plugin-solidity`](https://github.com/prettier-solidity/prettier-plugin-solidity))
-   1. `dapp lint`, a linter + static analyzer, like a combination of
+   1. `forge lint`, a linter + static analyzer, like a combination of
       [`solhint`](https://github.com/protofire/solhint) and
       [slither](https://github.com/crytic/slither/)
 1. Flamegraphs for gas profiling

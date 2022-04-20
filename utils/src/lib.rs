@@ -9,12 +9,16 @@ use ethers_core::{
     types::*,
 };
 use ethers_etherscan::Client;
-use ethers_solc::artifacts::{BytecodeObject, CompactBytecode, CompactContractBytecode};
+use ethers_solc::{
+    artifacts::{BytecodeObject, CompactBytecode, CompactContractBytecode},
+    ArtifactId,
+};
 use eyre::{Result, WrapErr};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashSet},
     env::VarError,
+    fmt,
 };
 
 use tokio::runtime::{Handle, Runtime};
@@ -46,6 +50,144 @@ impl RuntimeOrHandle {
             RuntimeOrHandle::Handle(handle) => tokio::task::block_in_place(|| handle.block_on(f)),
         }
     }
+}
+
+pub enum SelectorOrSig {
+    Selector(String),
+    Sig(Vec<String>),
+}
+
+pub struct PossibleSigs {
+    method: SelectorOrSig,
+    data: Vec<String>,
+}
+impl PossibleSigs {
+    fn new() -> Self {
+        PossibleSigs { method: SelectorOrSig::Selector("0x00000000".to_string()), data: vec![] }
+    }
+}
+impl fmt::Display for PossibleSigs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.method {
+            SelectorOrSig::Selector(selector) => {
+                writeln!(f, "\n Method: {}", selector)?;
+            }
+            SelectorOrSig::Sig(sigs) => {
+                writeln!(f, "\n Possible methods:")?;
+                for sig in sigs {
+                    writeln!(f, " - {}", sig)?;
+                }
+            }
+        }
+
+        writeln!(f, " ------------")?;
+        for (i, row) in self.data.iter().enumerate() {
+            let pad = if i < 10 { "  " } else { " " };
+            writeln!(f, " [{}]:{}{}", i, pad, row)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct PostLinkInput<'a, T, U> {
+    pub contract: CompactContractBytecode,
+    pub known_contracts: &'a mut BTreeMap<ArtifactId, T>,
+    pub id: ArtifactId,
+    pub extra: &'a mut U,
+    pub dependencies: Vec<ethers_core::types::Bytes>,
+}
+
+pub fn link<T, U>(
+    contracts: BTreeMap<ArtifactId, CompactContractBytecode>,
+    known_contracts: &mut BTreeMap<ArtifactId, T>,
+    sender: Address,
+    extra: &mut U,
+    link_key_construction: impl Fn(String, String) -> (String, String, String),
+    post_link: impl Fn(PostLinkInput<T, U>) -> eyre::Result<()>,
+) -> eyre::Result<()> {
+    // we dont use mainnet state for evm_opts.sender so this will always be 1
+    // I am leaving this here so that in the future if this needs to change,
+    // its easy to find.
+    let nonce = U256::one();
+
+    // create a mapping of fname => Vec<(fname, file, key)>,
+    let link_tree: BTreeMap<String, Vec<(String, String, String)>> = contracts
+        .iter()
+        .map(|(id, contract)| {
+            (
+                id.slug(),
+                contract
+                    .all_link_references()
+                    .iter()
+                    .flat_map(|(file, link)| {
+                        link.keys()
+                            .map(|key| link_key_construction(file.to_string(), key.to_string()))
+                    })
+                    .collect::<Vec<(String, String, String)>>(),
+            )
+        })
+        .collect();
+
+    let contracts_by_slug = contracts
+        .iter()
+        .map(|(i, c)| (i.slug(), c.clone()))
+        .collect::<BTreeMap<String, CompactContractBytecode>>();
+
+    for (id, contract) in contracts.into_iter() {
+        let (abi, maybe_deployment_bytes, maybe_runtime) = (
+            contract.abi.as_ref(),
+            contract.bytecode.as_ref(),
+            contract.deployed_bytecode.as_ref(),
+        );
+
+        if let (Some(abi), Some(bytecode), Some(runtime)) =
+            (abi, maybe_deployment_bytes, maybe_runtime)
+        {
+            // we are going to mutate, but library contract addresses may change based on
+            // the test so we clone
+            let mut target_bytecode = bytecode.clone();
+            let mut rt = runtime.clone();
+            let mut target_bytecode_runtime = rt.bytecode.expect("No target runtime").clone();
+
+            // instantiate a vector that gets filled with library deployment bytecode
+            let mut dependencies = vec![];
+
+            match bytecode.object {
+                BytecodeObject::Unlinked(_) => {
+                    // link needed
+                    recurse_link(
+                        id.slug(),
+                        (&mut target_bytecode, &mut target_bytecode_runtime),
+                        &contracts_by_slug,
+                        &link_tree,
+                        &mut dependencies,
+                        nonce,
+                        sender,
+                    );
+                }
+                BytecodeObject::Bytecode(ref bytes) => {
+                    if bytes.as_ref().is_empty() {
+                        // abstract, skip
+                        continue
+                    }
+                }
+            }
+
+            rt.bytecode = Some(target_bytecode_runtime);
+            let tc = CompactContractBytecode {
+                abi: Some(abi.clone()),
+                bytecode: Some(target_bytecode),
+                deployed_bytecode: Some(rt),
+            };
+
+            let post_link_input =
+                PostLinkInput { contract: tc, known_contracts, id, extra, dependencies };
+
+            post_link(post_link_input)?;
+        }
+    }
+    Ok(())
 }
 
 /// Recursively links bytecode given a target contract artifact name, the bytecode(s) to be linked,
@@ -111,8 +253,6 @@ pub fn recurse_link<'a>(
     }
 }
 
-const BASE_TX_COST: u64 = 21000;
-
 /// Helper trait for converting types to Functions. Helpful for allowing the `call`
 /// function on the EVM to be generic over `String`, `&str` and `Function`.
 pub trait IntoFunction {
@@ -141,30 +281,13 @@ impl<'a> IntoFunction for &'a str {
     fn into(self) -> Function {
         AbiParser::default()
             .parse_function(self)
-            .unwrap_or_else(|_| panic!("could not convert {} to function", self))
+            .unwrap_or_else(|_| panic!("could not convert {self} to function"))
     }
-}
-
-/// Given a gas value and a calldata array, it subtracts the calldata cost from the
-/// gas value, as well as the 21k base gas cost for all transactions.
-pub fn remove_extra_costs(gas: U256, calldata: &[u8]) -> U256 {
-    let mut calldata_cost = 0;
-    for i in calldata {
-        if *i != 0 {
-            // TODO: Check if EVM pre-eip2028 and charge 64
-            // GTXDATANONZERO = 16
-            calldata_cost += 16
-        } else {
-            // GTXDATAZERO = 4
-            calldata_cost += 4;
-        }
-    }
-    gas.saturating_sub(calldata_cost.into()).saturating_sub(BASE_TX_COST.into())
 }
 
 /// Flattens a group of contracts into maps of all events and functions
 pub fn flatten_known_contracts(
-    contracts: &BTreeMap<String, (Abi, Vec<u8>)>,
+    contracts: &BTreeMap<ArtifactId, (Abi, Vec<u8>)>,
 ) -> (BTreeMap<[u8; 4], Function>, BTreeMap<H256, Event>, Abi) {
     let flattened_funcs: BTreeMap<[u8; 4], Function> = contracts
         .iter()
@@ -271,6 +394,18 @@ pub fn decode_revert(error: &[u8], maybe_abi: Option<&Abi>) -> Result<String> {
                 }
                 Err(eyre::Error::msg("Non-native error and not string"))
             }
+            // keccak(expectRevert(bytes4))
+            [195, 30, 176, 224] => {
+                let err_data = &error[4..];
+                if err_data.len() == 32 {
+                    let actual_err = &err_data[..4];
+                    if let Ok(decoded) = decode_revert(actual_err, maybe_abi) {
+                        // it's a known selector
+                        return Ok(decoded)
+                    }
+                }
+                Err(eyre::Error::msg("Unknown error selector"))
+            }
             _ => {
                 // try to decode a custom error if provided an abi
                 if error.len() >= 4 {
@@ -338,7 +473,7 @@ pub async fn get_func_etherscan(
     contract: Address,
     args: &[String],
     chain: Chain,
-    etherscan_api_key: String,
+    etherscan_api_key: &str,
 ) -> Result<Function> {
     let client = Client::new(chain, etherscan_api_key)?;
     let metadata = &client.contract_source_code(contract).await?.items[0];
@@ -371,13 +506,6 @@ pub fn parse_tokens<'a, I: IntoIterator<Item = (&'a ParamType, &'a str)>>(
     params
         .into_iter()
         .map(|(param, value)| {
-            let value = match param {
-                // allow addresses and bytes to be passed with "0x"
-                ParamType::Address => value.strip_prefix("0x").unwrap_or(value),
-                ParamType::Bytes => value.strip_prefix("0x").unwrap_or(value),
-                ParamType::FixedBytes(_size) => value.strip_prefix("0x").unwrap_or(value),
-                _ => value,
-            };
             if lenient {
                 LenientTokenizer::tokenize(param, value)
             } else {
@@ -420,9 +548,19 @@ pub async fn fourbyte(selector: &str) -> Result<Vec<(String, i32)>> {
     }
     let selector = &selector[..8];
 
-    let url = format!("https://www.4byte.directory/api/v1/signatures/?hex_signature={}", selector);
+    let url = format!("https://www.4byte.directory/api/v1/signatures/?hex_signature={selector}");
     let res = reqwest::get(url).await?;
-    let api_response = res.json::<ApiResponse>().await?;
+    let res = res.text().await?;
+    let api_response = match serde_json::from_str::<ApiResponse>(&res) {
+        Ok(inner) => inner,
+        Err(err) => {
+            eyre::bail!("Could not decode response:\n {res}.\nError: {err}")
+        }
+    };
+
+    if api_response.results.is_empty() {
+        eyre::bail!("no signature found for provided function selector")
+    }
 
     Ok(api_response
         .results
@@ -493,8 +631,7 @@ pub async fn fourbyte_event(topic: &str) -> Result<Vec<(String, i32)>> {
     }
     let topic = &topic[..8];
 
-    let url =
-        format!("https://www.4byte.directory/api/v1/event-signatures/?hex_signature={}", topic);
+    let url = format!("https://www.4byte.directory/api/v1/event-signatures/?hex_signature={topic}");
     let res = reqwest::get(url).await?;
     let api_response = res.json::<ApiResponse>().await?;
 
@@ -503,6 +640,50 @@ pub async fn fourbyte_event(topic: &str) -> Result<Vec<(String, i32)>> {
         .into_iter()
         .map(|d| (d.text_signature, d.id))
         .collect::<Vec<(String, i32)>>())
+}
+
+/// Pretty print calldata and if available, fetch possible function signatures
+///
+/// ```no_run
+/// 
+/// use foundry_utils::pretty_calldata;
+///
+/// # async fn foo() -> eyre::Result<()> {
+///   let pretty_data = pretty_calldata("0x70a08231000000000000000000000000d0074f4e6490ae3f888d1d4f7e3e43326bd3f0f5".to_string(), false).await?;
+///   println!("{}",pretty_data);
+/// # Ok(())
+/// # }
+/// ```
+
+pub async fn pretty_calldata(calldata: impl AsRef<str>, offline: bool) -> Result<PossibleSigs> {
+    let mut possible_info = PossibleSigs::new();
+    let calldata = calldata.as_ref().trim_start_matches("0x");
+
+    let selector =
+        calldata.get(..8).ok_or_else(|| eyre::eyre!("calldata cannot be less that 4 bytes"))?;
+
+    let sigs = if offline {
+        vec![]
+    } else {
+        fourbyte(selector).await.unwrap_or_default().into_iter().map(|sig| sig.0).collect()
+    };
+    let (_, data) = calldata.split_at(8);
+
+    if data.len() % 64 != 0 {
+        eyre::bail!("\nInvalid calldata size")
+    }
+
+    let row_length = data.len() / 64;
+
+    for row in 0..row_length {
+        possible_info.data.push(data[64 * row..64 * (row + 1)].to_string());
+    }
+    if sigs.is_empty() {
+        possible_info.method = SelectorOrSig::Selector(selector.to_string());
+    } else {
+        possible_info.method = SelectorOrSig::Sig(sigs);
+    }
+    Ok(possible_info)
 }
 
 pub fn abi_decode(sig: &str, calldata: &str, input: bool) -> Result<Vec<Token>> {
@@ -566,19 +747,19 @@ pub fn format_token(param: &Token) -> String {
             }
         }
         Token::Uint(num) => num.to_string(),
-        Token::Bool(b) => format!("{}", b),
+        Token::Bool(b) => format!("{b}"),
         Token::String(s) => format!("{:?}", s),
         Token::FixedArray(tokens) => {
             let string = tokens.iter().map(format_token).collect::<Vec<String>>().join(", ");
-            format!("[{}]", string)
+            format!("[{string}]")
         }
         Token::Array(tokens) => {
             let string = tokens.iter().map(format_token).collect::<Vec<String>>().join(", ");
-            format!("[{}]", string)
+            format!("[{string}]")
         }
         Token::Tuple(tokens) => {
             let string = tokens.iter().map(format_token).collect::<Vec<String>>().join(", ");
-            format!("({})", string)
+            format!("({string})")
         }
     }
 }
@@ -627,7 +808,7 @@ fn format_param(param: &Param, structs: &mut HashSet<String>) -> String {
             ParamType::FixedArray(_, _) |
             ParamType::Tuple(_),
     );
-    let kind = if is_memory { format!("{} memory", kind) } else { kind };
+    let kind = if is_memory { format!("{kind} memory") } else { kind };
 
     if param.name.is_empty() {
         kind
@@ -675,7 +856,7 @@ fn get_param_type(
                 .collect::<Vec<_>>()
                 .join(" ");
 
-            let v2_struct = format!("struct {} {{ {} }}", name, args);
+            let v2_struct = format!("struct {name} {{ {args} }}");
             (name, Some(v2_struct))
         }
         // If not, just get the string of the param kind.
@@ -699,7 +880,7 @@ fn get_param_type(
 ///
 /// Notes:
 /// * ABI Encoder V2 is not supported yet
-/// * Kudos to https://github.com/maxme/abi2solidity for the algorithm
+/// * Kudos to [maxme/abi2solidity](https://github.com/maxme/abi2solidity) for the algorithm
 pub fn abi_to_solidity(contract_abi: &Abi, mut contract_name: &str) -> Result<String> {
     let functions_iterator = contract_abi.functions();
     let events_iterator = contract_abi.events();
@@ -720,7 +901,7 @@ pub fn abi_to_solidity(contract_abi: &Abi, mut contract_name: &str) -> Result<St
                 .join(", ");
 
             let event_final = format!("event {}({})", event.name, inputs);
-            format!("{};", event_final)
+            format!("{event_final};")
         })
         .collect::<Vec<_>>()
         .join("\n    ");
@@ -749,13 +930,13 @@ pub fn abi_to_solidity(contract_abi: &Abi, mut contract_name: &str) -> Result<St
 
             let mut func = format!("function {}({})", function.name, inputs);
             if !mutability.is_empty() {
-                func = format!("{} {}", func, mutability);
+                func = format!("{func} {mutability}");
             }
-            func = format!("{} external", func);
+            func = format!("{func} external");
             if !outputs.is_empty() {
-                func = format!("{} returns ({})", func, outputs);
+                func = format!("{func} returns ({outputs})");
             }
-            format!("{};", func)
+            format!("{func};")
         })
         .collect::<Vec<_>>()
         .join("\n    ");
@@ -806,107 +987,8 @@ pub fn abi_to_solidity(contract_abi: &Abi, mut contract_name: &str) -> Result<St
     })
 }
 
-pub struct PostLinkInput<'a, T, U> {
-    pub contract: CompactContractBytecode,
-    pub known_contracts: &'a mut BTreeMap<String, T>,
-    pub fname: String,
-    pub extra: &'a mut U,
-    pub dependencies: Vec<ethers_core::types::Bytes>,
-}
-
-pub fn link<T, U>(
-    contracts: &BTreeMap<String, CompactContractBytecode>,
-    known_contracts: &mut BTreeMap<String, T>,
-    sender: Address,
-    extra: &mut U,
-    link_key_construction: impl Fn(String, String) -> (String, String, String),
-    post_link: impl Fn(PostLinkInput<T, U>) -> eyre::Result<()>,
-) -> eyre::Result<()> {
-    // we dont use mainnet state for evm_opts.sender so this will always be 1
-    // I am leaving this here so that in the future if this needs to change,
-    // its easy to find.
-    let nonce = U256::one();
-
-    // create a mapping of fname => Vec<(fname, file, key)>,
-    let link_tree: BTreeMap<String, Vec<(String, String, String)>> = contracts
-        .iter()
-        .map(|(fname, contract)| {
-            (
-                fname.to_string(),
-                contract
-                    .all_link_references()
-                    .iter()
-                    .flat_map(|(file, link)| {
-                        link.keys()
-                            .map(|key| link_key_construction(file.to_string(), key.to_string()))
-                    })
-                    .collect::<Vec<(String, String, String)>>(),
-            )
-        })
-        .collect();
-
-    for fname in contracts.keys() {
-        let (abi, maybe_deployment_bytes, maybe_runtime) = if let Some(c) = contracts.get(fname) {
-            (c.abi.as_ref(), c.bytecode.as_ref(), c.deployed_bytecode.as_ref())
-        } else {
-            (None, None, None)
-        };
-        if let (Some(abi), Some(bytecode), Some(runtime)) =
-            (abi, maybe_deployment_bytes, maybe_runtime)
-        {
-            // we are going to mutate, but library contract addresses may change based on
-            // the test so we clone
-            let mut target_bytecode = bytecode.clone();
-            let mut rt = runtime.clone();
-            let mut target_bytecode_runtime = rt.bytecode.expect("No target runtime").clone();
-
-            // instantiate a vector that gets filled with library deployment bytecode
-            let mut dependencies = vec![];
-
-            match bytecode.object {
-                BytecodeObject::Unlinked(_) => {
-                    // link needed
-                    recurse_link(
-                        fname.to_string(),
-                        (&mut target_bytecode, &mut target_bytecode_runtime),
-                        contracts,
-                        &link_tree,
-                        &mut dependencies,
-                        nonce,
-                        sender,
-                    );
-                }
-                BytecodeObject::Bytecode(ref bytes) => {
-                    if bytes.as_ref().is_empty() {
-                        // abstract, skip
-                        continue
-                    }
-                }
-            }
-
-            rt.bytecode = Some(target_bytecode_runtime);
-            let tc = CompactContractBytecode {
-                abi: Some(abi.clone()),
-                bytecode: Some(target_bytecode),
-                deployed_bytecode: Some(rt),
-            };
-
-            let post_link_input = PostLinkInput {
-                contract: tc,
-                known_contracts,
-                fname: fname.to_string(),
-                extra,
-                dependencies,
-            };
-
-            post_link(post_link_input)?;
-        }
-    }
-    Ok(())
-}
-
 /// Enables tracing
-#[cfg(any(feature = "test", test))]
+#[cfg(any(feature = "test"))]
 pub fn init_tracing_subscriber() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -917,7 +999,115 @@ pub fn init_tracing_subscriber() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ethers_core::abi::Abi;
+    use ethers::{
+        abi::Abi,
+        solc::{artifacts::CompactContractBytecode, Project, ProjectPathsConfig},
+        types::{Address, Bytes},
+    };
+
+    #[test]
+    fn test_linking() {
+        let mut contract_names = [
+            "DSTest.json:DSTest",
+            "Lib.json:Lib",
+            "LibraryConsumer.json:LibraryConsumer",
+            "LibraryLinkingTest.json:LibraryLinkingTest",
+            "NestedLib.json:NestedLib",
+        ];
+        contract_names.sort_unstable();
+
+        let paths = ProjectPathsConfig::builder()
+            .root("../testdata")
+            .sources("../testdata/core")
+            .build()
+            .unwrap();
+
+        let project = Project::builder().paths(paths).ephemeral().no_artifacts().build().unwrap();
+
+        let output = project.compile().unwrap();
+        let contracts = output
+            .into_artifacts()
+            .filter(|(i, _)| contract_names.contains(&i.slug().as_str()))
+            .map(|(id, c)| (id, c.into_contract_bytecode()))
+            .collect::<BTreeMap<ArtifactId, CompactContractBytecode>>();
+
+        let mut known_contracts: BTreeMap<ArtifactId, (Abi, Vec<u8>)> = Default::default();
+        let mut deployable_contracts: BTreeMap<String, (Abi, Bytes, Vec<Bytes>)> =
+            Default::default();
+
+        let mut res = contracts.keys().map(|i| i.slug()).collect::<Vec<String>>();
+        res.sort_unstable();
+        assert_eq!(&res[..], &contract_names[..]);
+
+        let lib_linked = hex::encode(
+            &contracts
+                .iter()
+                .find(|(i, _)| i.slug() == "Lib.json:Lib")
+                .unwrap()
+                .1
+                .bytecode
+                .clone()
+                .expect("library had no bytecode")
+                .object
+                .into_bytes()
+                .expect("could not get bytecode as bytes"),
+        );
+        let nested_lib_unlinked = &contracts
+            .iter()
+            .find(|(i, _)| i.slug() == "NestedLib.json:NestedLib")
+            .unwrap()
+            .1
+            .bytecode
+            .as_ref()
+            .expect("nested library had no bytecode")
+            .object
+            .as_str()
+            .expect("could not get bytecode as str")
+            .to_string();
+
+        link(
+            contracts,
+            &mut known_contracts,
+            Address::default(),
+            &mut deployable_contracts,
+            |file, key| (format!("{key}.json:{key}"), file, key),
+            |post_link_input| {
+                match post_link_input.id.slug().as_str() {
+                    "DSTest.json:DSTest" => {
+                        assert_eq!(post_link_input.dependencies.len(), 0);
+                    }
+                    "LibraryLinkingTest.json:LibraryLinkingTest" => {
+                        assert_eq!(post_link_input.dependencies.len(), 3);
+                        assert_eq!(hex::encode(&post_link_input.dependencies[0]), lib_linked);
+                        assert_eq!(hex::encode(&post_link_input.dependencies[1]), lib_linked);
+                        assert_ne!(
+                            hex::encode(&post_link_input.dependencies[2]),
+                            *nested_lib_unlinked
+                        );
+                    }
+                    "Lib.json:Lib" => {
+                        assert_eq!(post_link_input.dependencies.len(), 0);
+                    }
+                    "NestedLib.json:NestedLib" => {
+                        assert_eq!(post_link_input.dependencies.len(), 1);
+                        assert_eq!(hex::encode(&post_link_input.dependencies[0]), lib_linked);
+                    }
+                    "LibraryConsumer.json:LibraryConsumer" => {
+                        assert_eq!(post_link_input.dependencies.len(), 3);
+                        assert_eq!(hex::encode(&post_link_input.dependencies[0]), lib_linked);
+                        assert_eq!(hex::encode(&post_link_input.dependencies[1]), lib_linked);
+                        assert_ne!(
+                            hex::encode(&post_link_input.dependencies[2]),
+                            *nested_lib_unlinked
+                        );
+                    }
+                    s => panic!("unexpected slug {s}"),
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
 
     #[test]
     fn test_resolve_addr() {
@@ -998,19 +1188,30 @@ mod tests {
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn abi2solidity() {
-        let contract_abi: Abi =
-            serde_json::from_slice(&std::fs::read("testdata/interfaceTestABI.json").unwrap())
-                .unwrap();
+        let contract_abi: Abi = serde_json::from_slice(
+            &std::fs::read("../testdata/fixtures/SolidityGeneration/InterfaceABI.json").unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            std::str::from_utf8(&std::fs::read("testdata/interfaceTest.sol").unwrap())
+            std::str::from_utf8(
+                &std::fs::read(
+                    "../testdata/fixtures/SolidityGeneration/GeneratedNamedInterface.sol"
+                )
                 .unwrap()
-                .to_string(),
+            )
+            .unwrap()
+            .to_string(),
             abi_to_solidity(&contract_abi, "test").unwrap()
         );
         assert_eq!(
-            std::str::from_utf8(&std::fs::read("testdata/interfaceTestNoName.sol").unwrap())
+            std::str::from_utf8(
+                &std::fs::read(
+                    "../testdata/fixtures/SolidityGeneration/GeneratedUnnamedInterface.sol"
+                )
                 .unwrap()
-                .to_string(),
+            )
+            .unwrap()
+            .to_string(),
             abi_to_solidity(&contract_abi, "").unwrap()
         );
     }

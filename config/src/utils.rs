@@ -11,7 +11,17 @@ use figment::value::Value;
 
 /// Loads the config for the current project workspace
 pub fn load_config() -> Config {
-    Config::load_with_root(find_project_root_path().unwrap()).sanitized()
+    load_config_with_root(None)
+}
+
+/// Loads the config for the current project workspace or the provided root path
+pub fn load_config_with_root(root: Option<PathBuf>) -> Config {
+    if let Some(root) = root {
+        Config::load_with_root(root)
+    } else {
+        Config::load_with_root(find_project_root_path().unwrap())
+    }
+    .sanitized()
 }
 
 /// Returns the path of the top-level directory of the working git tree. If there is no working
@@ -106,15 +116,15 @@ pub fn parse_libraries(
         let mut items = lib.split(':');
         let file = items
             .next()
-            .ok_or_else(|| SolcError::msg(format!("failed to parse invalid library: {}", lib)))?;
+            .ok_or_else(|| SolcError::msg(format!("failed to parse invalid library: {lib}")))?;
         let lib = items
             .next()
-            .ok_or_else(|| SolcError::msg(format!("failed to parse invalid library: {}", lib)))?;
+            .ok_or_else(|| SolcError::msg(format!("failed to parse invalid library: {lib}")))?;
         let addr = items
             .next()
-            .ok_or_else(|| SolcError::msg(format!("failed to parse invalid library: {}", lib)))?;
+            .ok_or_else(|| SolcError::msg(format!("failed to parse invalid library: {lib}")))?;
         if items.next().is_some() {
-            return Err(SolcError::msg(format!("failed to parse invalid library: {}", lib)))
+            return Err(SolcError::msg(format!("failed to parse invalid library: {lib}")))
         }
         libraries
             .entry(file.to_string())
@@ -138,7 +148,7 @@ pub fn to_array_value(val: &str) -> Result<Value, figment::Error> {
             .into(),
         Value::Empty(_, _) => Vec::<Value>::new().into(),
         val @ Value::Array(_, _) => val,
-        _ => return Err(format!("Invalid value `{}`, expected an array", val).into()),
+        _ => return Err(format!("Invalid value `{val}`, expected an array").into()),
     };
     Ok(value)
 }

@@ -1,26 +1,54 @@
 [workspace]
 members = [
-    "evm-adapters",
-    "utils",
     "cast",
-    "forge",
+    "binder",
     "cli",
     "cli/test-utils",
+    "common",
     "config",
+    "evm",
     "fmt",
+    "forge",
+    "ui",
+    "utils",
 ]
 
-# Binary size optimizations
+[profile.dev]
+# Disabling debug info speeds up builds a bunch,
+# and we don't rely on it for debugging that much
+debug = 0
+
+[profile.dev.package]
+# These speed up local tests
+ethers-solc.opt-level = 3
+
+# local "release" mode
+[profile.local]
+inherits = "dev"
+opt-level = 3
+# Set this to 1 or 2 to get more useful backtraces
+debug = 0
+panic = 'unwind'
+# better recompile times
+incremental = true
+codegen-units = 16
+
+
 [profile.release]
-opt-level = "z"
-lto = true
+# Optimize for binary size, but keep loop vectorization
+opt-level = "s"
+strip = true
+# Performance optimizations
+lto = "fat"
 codegen-units = 1
 panic = "abort"
-debug = true
+# We end up stripping away these symbols anyway
+debug = 0
 
 ## Patch ethers-rs with a local checkout
 [patch."https://github.com/gakonst/ethers-rs"]
 ethers = { path = "../ethers-rs" }
+ethers-contract = { path = "../ethers-rs/ethers-contract" }
 ethers-core = { path = "../ethers-rs/ethers-core" }
 ethers-providers = { path = "../ethers-rs/ethers-providers" }
 ethers-signers = { path = "../ethers-rs/ethers-signers" }
