@@ -5,10 +5,9 @@ use crate::{
         Cmd,
     },
     compile::ProjectCompiler,
-    utils,
+    suggestions, utils,
     utils::FoundryPathExt,
 };
-use ansi_term::Colour;
 use clap::{AppSettings, Parser};
 use ethers::solc::FileFilter;
 use forge::{
@@ -26,12 +25,14 @@ use foundry_config::{figment::Figment, Config};
 use regex::Regex;
 use std::{
     collections::BTreeMap,
+    fmt,
     path::{Path, PathBuf},
     sync::mpsc::channel,
     thread,
     time::Duration,
 };
 use watchexec::config::{InitConfig, RuntimeConfig};
+use yansi::Paint;
 
 #[derive(Debug, Clone, Parser)]
 pub struct Filter {
@@ -69,6 +70,32 @@ pub struct Filter {
         conflicts_with = "pattern"
     )]
     pub path_pattern_inverse: Option<globset::Glob>,
+}
+
+impl Filter {
+    pub fn with_merged_config(&self) -> Self {
+        let config = Config::load();
+        let mut filter = self.clone();
+        if filter.test_pattern.is_none() {
+            filter.test_pattern = config.test_pattern.map(|p| p.into());
+        }
+        if filter.test_pattern_inverse.is_none() {
+            filter.test_pattern_inverse = config.test_pattern_inverse.map(|p| p.into());
+        }
+        if filter.contract_pattern.is_none() {
+            filter.contract_pattern = config.contract_pattern.map(|p| p.into());
+        }
+        if filter.contract_pattern_inverse.is_none() {
+            filter.contract_pattern_inverse = config.contract_pattern_inverse.map(|p| p.into());
+        }
+        if filter.path_pattern.is_none() {
+            filter.path_pattern = config.path_pattern;
+        }
+        if filter.path_pattern_inverse.is_none() {
+            filter.path_pattern_inverse = config.path_pattern_inverse;
+        }
+        filter
+    }
 }
 
 impl FileFilter for Filter {
@@ -131,6 +158,34 @@ impl TestFilter for Filter {
     }
 }
 
+impl fmt::Display for Filter {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut patterns = Vec::new();
+        if let Some(ref p) = self.pattern {
+            patterns.push(format!("\tmatch: `{}`", p.as_str()));
+        }
+        if let Some(ref p) = self.test_pattern {
+            patterns.push(format!("\tmatch-test: `{}`", p.as_str()));
+        }
+        if let Some(ref p) = self.test_pattern_inverse {
+            patterns.push(format!("\tno-match-test: `{}`", p.as_str()));
+        }
+        if let Some(ref p) = self.contract_pattern {
+            patterns.push(format!("\tmatch-contract: `{}`", p.as_str()));
+        }
+        if let Some(ref p) = self.contract_pattern_inverse {
+            patterns.push(format!("\tno-match-contract: `{}`", p.as_str()));
+        }
+        if let Some(ref p) = self.path_pattern {
+            patterns.push(format!("\tmatch-path: `{}`", p.glob()));
+        }
+        if let Some(ref p) = self.path_pattern_inverse {
+            patterns.push(format!("\tno-match-path: `{}`", p.glob()));
+        }
+        write!(f, "{}", patterns.join("\n"))
+    }
+}
+
 // Loads project's figment and merges the build cli arguments into it
 foundry_config::impl_figment_convert!(TestArgs, opts, evm_opts);
 
@@ -185,6 +240,10 @@ pub struct TestArgs {
 
     #[clap(flatten, next_help_heading = "WATCH OPTIONS")]
     pub watch: WatchArgs,
+
+    /// List tests instead of running them
+    #[clap(long, short, help_heading = "DISPLAY OPTIONS")]
+    list: bool,
 }
 
 impl TestArgs {
@@ -193,9 +252,9 @@ impl TestArgs {
         &self.opts
     }
 
-    /// Returns the flattened [`Filter`] arguments
-    pub fn filter(&self) -> &Filter {
-        &self.filter
+    /// Returns the flattened [`Filter`] arguments merged with [`Config`]
+    pub fn filter(&self) -> Filter {
+        self.filter.with_merged_config()
     }
 
     /// Returns the currently configured [Config] and the extracted [EvmOpts] from that config
@@ -220,7 +279,10 @@ impl TestArgs {
     /// Returns the [`watchexec::InitConfig`] and [`watchexec::RuntimeConfig`] necessary to
     /// bootstrap a new [`watchexe::Watchexec`] loop.
     pub(crate) fn watchexec_config(&self) -> eyre::Result<(InitConfig, RuntimeConfig)> {
-        self.watch.watchexec_config(|| Config::from(self).src)
+        self.watch.watchexec_config(|| {
+            let config = Config::from(self);
+            vec![config.src, config.test]
+        })
     }
 }
 
@@ -313,8 +375,8 @@ impl TestOutcome {
                 let successes = self.successes().count();
                 println!(
                     "Encountered a total of {} failing tests, {} tests succeeded",
-                    Colour::Red.paint(failures.to_string()),
-                    Colour::Green.paint(successes.to_string())
+                    Paint::red(failures.to_string()),
+                    Paint::green(successes.to_string())
                 );
                 std::process::exit(1);
             }
@@ -330,8 +392,7 @@ impl TestOutcome {
 
     pub fn summary(&self) -> String {
         let failed = self.failures().count();
-        let result =
-            if failed == 0 { Colour::Green.paint("ok") } else { Colour::Red.paint("FAILED") };
+        let result = if failed == 0 { Paint::green("ok") } else { Paint::red("FAILED") };
         format!(
             "Test result: {}. {} passed; {} failed; finished in {:.2?}",
             result,
@@ -344,7 +405,7 @@ impl TestOutcome {
 
 fn short_test_result(name: &str, result: &forge::TestResult) {
     let status = if result.success {
-        Colour::Green.paint("[PASS]")
+        Paint::green("[PASS]".to_string())
     } else {
         let txt = match (&result.reason, &result.counterexample) {
             (Some(ref reason), Some(ref counterexample)) => {
@@ -359,13 +420,13 @@ fn short_test_result(name: &str, result: &forge::TestResult) {
             (None, None) => "[FAIL]".to_string(),
         };
 
-        Colour::Red.paint(txt)
+        Paint::red(txt)
     };
 
     println!("{} {} {}", status, name, result.kind.gas_used());
 }
 
-pub fn custom_run(mut args: TestArgs, include_fuzz_tests: bool) -> eyre::Result<TestOutcome> {
+pub fn custom_run(args: TestArgs, include_fuzz_tests: bool) -> eyre::Result<TestOutcome> {
     // Merge all configs
     let (config, mut evm_opts) = args.config_and_evm_opts()?;
 
@@ -379,12 +440,13 @@ pub fn custom_run(mut args: TestArgs, include_fuzz_tests: bool) -> eyre::Result<
         ..Default::default()
     };
     let fuzzer = proptest::test_runner::TestRunner::new(cfg);
+    let mut filter = args.filter();
 
     // Set up the project
     let project = config.project()?;
     let compiler = ProjectCompiler::default();
     let output = if config.sparse_mode {
-        compiler.compile_sparse(&project, args.filter.clone())
+        compiler.compile_sparse(&project, filter.clone())
     } else {
         compiler.compile(&project)
     }?;
@@ -396,7 +458,7 @@ pub fn custom_run(mut args: TestArgs, include_fuzz_tests: bool) -> eyre::Result<
     }
 
     // Prepare the test builder
-    let evm_spec = crate::utils::evm_spec(&config.evm_version);
+    let evm_spec = utils::evm_spec(&config.evm_version);
     let mut runner = MultiContractRunnerBuilder::default()
         .fuzzer(fuzzer)
         .initial_balance(evm_opts.initial_balance)
@@ -406,11 +468,11 @@ pub fn custom_run(mut args: TestArgs, include_fuzz_tests: bool) -> eyre::Result<
         .build(project.paths.root, output, evm_opts)?;
 
     if args.debug.is_some() {
-        args.filter.test_pattern = args.debug;
-        match runner.count_filtered_tests(&args.filter) {
+        filter.test_pattern = args.debug;
+        match runner.count_filtered_tests(&filter) {
                 1 => {
                     // Run the test
-                    let results = runner.test(&args.filter, None, true)?;
+                    let results = runner.test(&filter, None, true)?;
 
                     // Get the result of the single test
                     let (id, sig, test_kind, counterexample) = results.iter().map(|(id, SuiteResult{ test_results, .. })| {
@@ -451,8 +513,9 @@ pub fn custom_run(mut args: TestArgs, include_fuzz_tests: bool) -> eyre::Result<
                         \n
                         Use --match-contract and --match-path to further limit the search."))
             }
+    } else if args.list {
+        list(runner, filter, args.json)
     } else {
-        let TestArgs { filter, .. } = args;
         test(
             config,
             runner,
@@ -464,6 +527,24 @@ pub fn custom_run(mut args: TestArgs, include_fuzz_tests: bool) -> eyre::Result<
             args.gas_report,
         )
     }
+}
+
+/// Lists all matching tests
+fn list(runner: MultiContractRunner, filter: Filter, json: bool) -> eyre::Result<TestOutcome> {
+    let results = runner.list(&filter);
+
+    if json {
+        println!("{}", serde_json::to_string(&results)?);
+    } else {
+        for (file, contracts) in results.iter() {
+            println!("{}", file);
+            for (contract, tests) in contracts.iter() {
+                println!("  {}", contract);
+                println!("    {}\n", tests.join("\n    "));
+            }
+        }
+    }
+    Ok(TestOutcome::new(BTreeMap::new(), false))
 }
 
 /// Runs all the tests
@@ -478,6 +559,26 @@ fn test(
     include_fuzz_tests: bool,
     gas_reporting: bool,
 ) -> eyre::Result<TestOutcome> {
+    if runner.count_filtered_tests(&filter) == 0 {
+        let filter_str = filter.to_string();
+        if filter_str.is_empty() {
+            println!(
+                "\nNo tests found in project! Forge looks for functions that starts with `test`."
+            );
+        } else {
+            println!("\nNo tests match the provided pattern:");
+            println!("{}", filter_str);
+            // Try to suggest a test when there's no match
+            if let Some(ref test_pattern) = filter.test_pattern {
+                let test_name = test_pattern.as_str();
+                let candidates = runner.get_tests(&filter);
+                if let Some(suggestion) = suggestions::did_you_mean(test_name, &candidates).pop() {
+                    println!("\nDid you mean `{}`?", suggestion);
+                }
+            }
+        }
+    }
+
     if json {
         let results = runner.test(&filter, None, include_fuzz_tests)?;
         println!("{}", serde_json::to_string(&results)?);
@@ -509,7 +610,7 @@ fn test(
             let mut tests = suite_result.test_results.clone();
             println!();
             for warning in suite_result.warnings.iter() {
-                eprintln!("{} {}", Colour::Yellow.bold().paint("Warning:"), warning);
+                eprintln!("{} {}", Paint::yellow("Warning:").bold(), warning);
             }
             if !tests.is_empty() {
                 let term = if tests.len() > 1 { "tests" } else { "test" };

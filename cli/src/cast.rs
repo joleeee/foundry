@@ -1,6 +1,7 @@
 pub mod cmd;
 pub mod compile;
 
+mod suggestions;
 mod term;
 mod utils;
 
@@ -9,11 +10,10 @@ use foundry_config::Config;
 mod opts;
 use cast::InterfacePath;
 use ethers::{
-    contract::BaseContract,
     core::{
-        abi::parse_abi,
+        abi::AbiParser,
         rand::thread_rng,
-        types::{BlockId, BlockNumber::Latest},
+        types::{BlockId, BlockNumber::Latest, H256},
     },
     providers::{Middleware, Provider},
     signers::{LocalWallet, Signer},
@@ -47,6 +47,8 @@ use eyre::WrapErr;
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     color_eyre::install()?;
+    utils::subscriber();
+    utils::enable_paint();
 
     let opts = Opts::parse();
     match opts.sub {
@@ -58,6 +60,12 @@ async fn main() -> eyre::Result<()> {
         }
         Subcommands::MaxUint => {
             println!("{}", SimpleCast::max_uint()?);
+        }
+        Subcommands::AddressZero => {
+            println!("{:?}", Address::zero());
+        }
+        Subcommands::HashZero => {
+            println!("{:?}", H256::zero());
         }
         Subcommands::FromUtf8 { text } => {
             let val = unwrap_or_stdin(text)?;
@@ -163,8 +171,12 @@ async fn main() -> eyre::Result<()> {
             let provider = Provider::try_from(
                 config.eth_rpc_url.unwrap_or_else(|| "http://localhost:8545".to_string()),
             )?;
+
+            let chain_id = Cast::new(&provider).chain_id().await?;
+            let chain = Chain::try_from(chain_id.as_u64()).unwrap_or(eth.chain);
+
             let mut builder =
-                TxBuilder::new(&provider, config.sender, address, eth.chain, false).await?;
+                TxBuilder::new(&provider, config.sender, address, chain, false).await?;
             builder.set_args(&sig, args).await?;
             let builder_output = builder.peek();
 
@@ -187,9 +199,12 @@ async fn main() -> eyre::Result<()> {
                 config.eth_rpc_url.unwrap_or_else(|| "http://localhost:8545".to_string()),
             )?;
 
+            let chain_id = provider.get_chainid().await?;
+            let chain = Chain::try_from(chain_id.as_u64()).unwrap_or(eth.chain);
+
             let mut builder =
-                TxBuilder::new(&provider, config.sender, address, eth.chain, false).await?;
-            builder.set_args(&sig, args).await?.etherscan_api_key(eth.etherscan_api_key);
+                TxBuilder::new(&provider, config.sender, address, chain, false).await?;
+            builder.etherscan_api_key(config.etherscan_api_key).set_args(&sig, args).await?;
             let builder_output = builder.build();
             println!("{}", Cast::new(provider).call(builder_output, block).await?);
         }
@@ -255,6 +270,7 @@ async fn main() -> eyre::Result<()> {
                 config.eth_rpc_url.unwrap_or_else(|| "http://localhost:8545".to_string()),
             )?;
             let chain_id = Cast::new(&provider).chain_id().await?;
+            let chain = Chain::try_from(chain_id.as_u64()).unwrap_or(eth.chain);
             let sig = sig.unwrap_or_default();
 
             if let Ok(Some(signer)) = eth.signer_with(chain_id, provider.clone()).await {
@@ -279,7 +295,7 @@ async fn main() -> eyre::Result<()> {
                             gas_price,
                             value,
                             nonce,
-                            eth.chain,
+                            chain,
                             config.etherscan_api_key,
                             cast_async,
                             legacy,
@@ -298,7 +314,7 @@ async fn main() -> eyre::Result<()> {
                             gas_price,
                             value,
                             nonce,
-                            eth.chain,
+                            chain,
                             config.etherscan_api_key,
                             cast_async,
                             legacy,
@@ -317,7 +333,7 @@ async fn main() -> eyre::Result<()> {
                             gas_price,
                             value,
                             nonce,
-                            eth.chain,
+                            chain,
                             config.etherscan_api_key,
                             cast_async,
                             legacy,
@@ -344,7 +360,7 @@ async fn main() -> eyre::Result<()> {
                     gas_price,
                     value,
                     nonce,
-                    eth.chain,
+                    chain,
                     config.etherscan_api_key,
                     cast_async,
                     legacy,
@@ -379,9 +395,12 @@ async fn main() -> eyre::Result<()> {
                 config.eth_rpc_url.unwrap_or_else(|| "http://localhost:8545".to_string()),
             )?;
 
+            let chain_id = Cast::new(&provider).chain_id().await?;
+            let chain = Chain::try_from(chain_id.as_u64()).unwrap_or(eth.chain);
+
             let from = eth.sender().await;
 
-            let mut builder = TxBuilder::new(&provider, from, to, eth.chain, false).await?;
+            let mut builder = TxBuilder::new(&provider, from, to, chain, false).await?;
             builder
                 .etherscan_api_key(config.etherscan_api_key)
                 .value(value)
@@ -482,13 +501,15 @@ async fn main() -> eyre::Result<()> {
 
         Subcommands::Interface {
             path_or_address,
+            name,
             pragma,
             chain,
             output_location,
             etherscan_api_key,
         } => {
             let interfaces = if Path::new(&path_or_address).exists() {
-                SimpleCast::generate_interface(InterfacePath::Local(path_or_address)).await?
+                SimpleCast::generate_interface(InterfacePath::Local { path: path_or_address, name })
+                    .await?
             } else {
                 let api_key = match etherscan_api_key {
                     Some(inner) => inner,
@@ -621,8 +642,7 @@ async fn main() -> eyre::Result<()> {
             }
         }
         Subcommands::Sig { sig } => {
-            let contract = BaseContract::from(parse_abi(&[&sig]).unwrap());
-            let selector = contract.abi().functions().last().unwrap().short_signature();
+            let selector = AbiParser::default().parse_function(&sig).unwrap().short_signature();
             println!("0x{}", hex::encode(selector));
         }
         Subcommands::FindBlock(cmd) => cmd.run()?.await?,
@@ -766,6 +786,7 @@ async fn main() -> eyre::Result<()> {
         Subcommands::Completions { shell } => {
             generate(shell, &mut Opts::command(), "cast", &mut std::io::stdout())
         }
+        Subcommands::Run(cmd) => cmd.run()?,
     };
     Ok(())
 }
@@ -811,13 +832,13 @@ where
     let params = if !sig.is_empty() { Some((&sig[..], params)) } else { None };
     let mut builder = TxBuilder::new(&provider, from, to, chain, legacy).await?;
     builder
+        .etherscan_api_key(etherscan_api_key)
         .args(params)
         .await?
         .gas(gas)
         .gas_price(gas_price)
         .value(value)
-        .nonce(nonce)
-        .etherscan_api_key(etherscan_api_key);
+        .nonce(nonce);
     let builder_output = builder.build();
 
     let cast = Cast::new(provider);

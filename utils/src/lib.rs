@@ -14,43 +14,15 @@ use ethers_solc::{
     ArtifactId,
 };
 use eyre::{Result, WrapErr};
+use futures::future::BoxFuture;
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashSet},
     env::VarError,
-    fmt,
+    fmt::{self, Write},
+    str::FromStr,
+    time::Duration,
 };
-
-use tokio::runtime::{Handle, Runtime};
-
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug)]
-pub enum RuntimeOrHandle {
-    Runtime(Runtime),
-    Handle(Handle),
-}
-
-impl Default for RuntimeOrHandle {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RuntimeOrHandle {
-    pub fn new() -> RuntimeOrHandle {
-        match Handle::try_current() {
-            Ok(handle) => RuntimeOrHandle::Handle(handle),
-            Err(_) => RuntimeOrHandle::Runtime(Runtime::new().expect("Failed to start runtime")),
-        }
-    }
-
-    pub fn block_on<F: std::future::Future>(&self, f: F) -> F::Output {
-        match &self {
-            RuntimeOrHandle::Runtime(runtime) => runtime.block_on(f),
-            RuntimeOrHandle::Handle(handle) => tokio::task::block_in_place(|| handle.block_on(f)),
-        }
-    }
-}
 
 pub enum SelectorOrSig {
     Selector(String),
@@ -447,7 +419,7 @@ pub fn to_table(value: serde_json::Value) -> String {
         serde_json::Value::Object(map) => {
             let mut s = String::new();
             for (k, v) in map.iter() {
-                s.push_str(&format!("{: <20} {}\n", k, v));
+                writeln!(&mut s, "{: <20} {}\n", k, v).expect("could not write k/v to table");
             }
             s
         }
@@ -499,18 +471,48 @@ pub async fn get_func_etherscan(
 }
 
 /// Parses string input as Token against the expected ParamType
+#[allow(clippy::no_effect)]
 pub fn parse_tokens<'a, I: IntoIterator<Item = (&'a ParamType, &'a str)>>(
     params: I,
     lenient: bool,
-) -> eyre::Result<Vec<Token>> {
+) -> Result<Vec<Token>> {
     params
         .into_iter()
         .map(|(param, value)| {
-            if lenient {
+            let mut token = if lenient {
                 LenientTokenizer::tokenize(param, value)
             } else {
                 StrictTokenizer::tokenize(param, value)
+            };
+
+            if token.is_err() && value.starts_with("0x") {
+                match param {
+                    ParamType::FixedBytes(32) => {
+                        if value.len() < 66 {
+                            let padded_value = [value, &"0".repeat(66 - value.len())].concat();
+                            token = if lenient {
+                                LenientTokenizer::tokenize(param, &padded_value)
+                            } else {
+                                StrictTokenizer::tokenize(param, &padded_value)
+                            };
+                        }
+                    }
+                    ParamType::Uint(_) => {
+                        // try again if value is hex
+                        if let Ok(value) = U256::from_str(value).map(|v| v.to_string()) {
+                            token = if lenient {
+                                LenientTokenizer::tokenize(param, &value)
+                            } else {
+                                StrictTokenizer::tokenize(param, &value)
+                            };
+                        }
+                    }
+                    // TODO: Not sure what to do here. Put the no effect in for now, but that is not
+                    // ideal. We could attempt massage for every value type?
+                    _ => {}
+                }
             }
+            token
         })
         .collect::<Result<_, _>>()
         .wrap_err("Failed to parse tokens")
@@ -738,14 +740,7 @@ pub fn format_token(param: &Token) -> String {
         Token::Address(addr) => format!("{:?}", addr),
         Token::FixedBytes(bytes) => format!("0x{}", hex::encode(&bytes)),
         Token::Bytes(bytes) => format!("0x{}", hex::encode(&bytes)),
-        Token::Int(mut num) => {
-            if num.bit(255) {
-                num = num - 1;
-                format!("-{}", num.overflowing_neg().0)
-            } else {
-                num.to_string()
-            }
-        }
+        Token::Int(num) => format!("{}", I256::from_raw(*num)),
         Token::Uint(num) => num.to_string(),
         Token::Bool(b) => format!("{b}"),
         Token::String(s) => format!("{:?}", s),
@@ -987,6 +982,56 @@ pub fn abi_to_solidity(contract_abi: &Abi, mut contract_name: &str) -> Result<St
     })
 }
 
+/// A type that keeps track of attempts
+#[derive(Debug, Clone)]
+pub struct Retry {
+    retries: u32,
+    delay: Option<u32>,
+}
+
+/// Sample retry logic implementation
+impl Retry {
+    pub fn new(retries: u32, delay: Option<u32>) -> Self {
+        Self { retries, delay }
+    }
+
+    fn handle_err(&mut self, err: eyre::Report) {
+        self.retries -= 1;
+        tracing::warn!(
+            "erroneous attempt ({} tries remaining): {}",
+            self.retries,
+            err.root_cause()
+        );
+        if let Some(delay) = self.delay {
+            std::thread::sleep(Duration::from_secs(delay.into()));
+        }
+    }
+
+    pub fn run<T, F>(mut self, mut callback: F) -> eyre::Result<T>
+    where
+        F: FnMut() -> eyre::Result<T>,
+    {
+        loop {
+            match callback() {
+                Err(e) if self.retries > 0 => self.handle_err(e),
+                res => return res,
+            }
+        }
+    }
+
+    pub async fn run_async<'a, T, F>(mut self, mut callback: F) -> eyre::Result<T>
+    where
+        F: FnMut() -> BoxFuture<'a, eyre::Result<T>>,
+    {
+        loop {
+            match callback().await {
+                Err(e) if self.retries > 0 => self.handle_err(e),
+                res => return res,
+            };
+        }
+    }
+}
+
 /// Enables tracing
 #[cfg(any(feature = "test"))]
 pub fn init_tracing_subscriber() {
@@ -1004,6 +1049,20 @@ mod tests {
         solc::{artifacts::CompactContractBytecode, Project, ProjectPathsConfig},
         types::{Address, Bytes},
     };
+    use std::future::Future;
+
+    #[test]
+    fn parse_hex_uint_tokens() {
+        let param = ParamType::Uint(256);
+
+        let tokens = parse_tokens(std::iter::once((&param, "100")), true).unwrap();
+        assert_eq!(tokens, vec![Token::Uint(100u64.into())]);
+
+        let val: U256 = 100u64.into();
+        let hex_val = format!("0x{:x}", val);
+        let tokens = parse_tokens(std::iter::once((&param, hex_val.as_str())), true).unwrap();
+        assert_eq!(tokens, vec![Token::Uint(100u64.into())]);
+    }
 
     #[test]
     fn test_linking() {
@@ -1146,43 +1205,72 @@ mod tests {
         );
     }
 
+    /// Executes the _fourbyte_ request and if the site is not down (502 Bad Gateway) executes the
+    /// test
+    async fn test_if_fourbyte_not_down<Req, Out, Test>(r: Req, test: Test)
+    where
+        Req: Future<Output = Result<Out>>,
+        Test: FnOnce(Out),
+    {
+        match r.await {
+            Ok(out) => test(out),
+            Err(err) => {
+                let msg = err.to_string();
+                eprintln!("fourbyte request failed:\n{}", msg);
+                if !msg.contains("502 Bad Gateway") {
+                    panic!("{}", msg)
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_fourbyte() {
-        let sigs = fourbyte("0xa9059cbb").await.unwrap();
-        assert_eq!(sigs[0].0, "func_2093253501(bytes)".to_string());
-        assert_eq!(sigs[0].1, 313067);
+        test_if_fourbyte_not_down(fourbyte("0xa9059cbb"), |sigs| {
+            assert_eq!(sigs[0].0, "func_2093253501(bytes)".to_string());
+            assert_eq!(sigs[0].1, 313067);
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_fourbyte_possible_sigs() {
-        let sigs = fourbyte_possible_sigs("0xa9059cbb0000000000000000000000000a2ac0c368dc8ec680a0c98c907656bd970675950000000000000000000000000000000000000000000000000000000767954a79", None).await.unwrap();
-        assert_eq!(sigs[0], "many_msg_babbage(bytes1)".to_string());
-        assert_eq!(sigs[1], "transfer(address,uint256)".to_string());
+        test_if_fourbyte_not_down( fourbyte_possible_sigs("0xa9059cbb0000000000000000000000000a2ac0c368dc8ec680a0c98c907656bd970675950000000000000000000000000000000000000000000000000000000767954a79", None), |sigs| {
+            assert_eq!(sigs[0], "many_msg_babbage(bytes1)".to_string());
+            assert_eq!(sigs[1], "transfer(address,uint256)".to_string());
+        }).await;
 
-        let sigs = fourbyte_possible_sigs("0xa9059cbb0000000000000000000000000a2ac0c368dc8ec680a0c98c907656bd970675950000000000000000000000000000000000000000000000000000000767954a79", Some("earliest".to_string())).await.unwrap();
-        assert_eq!(sigs[0], "transfer(address,uint256)".to_string());
+        test_if_fourbyte_not_down( fourbyte_possible_sigs("0xa9059cbb0000000000000000000000000a2ac0c368dc8ec680a0c98c907656bd970675950000000000000000000000000000000000000000000000000000000767954a79", Some("earliest".to_string())), |sigs| {
+            assert_eq!(sigs[0], "transfer(address,uint256)".to_string());
+        }).await;
 
-        let sigs = fourbyte_possible_sigs("0xa9059cbb0000000000000000000000000a2ac0c368dc8ec680a0c98c907656bd970675950000000000000000000000000000000000000000000000000000000767954a79", Some("latest".to_string())).await.unwrap();
-        assert_eq!(sigs[0], "func_2093253501(bytes)".to_string());
+        test_if_fourbyte_not_down( fourbyte_possible_sigs("0xa9059cbb0000000000000000000000000a2ac0c368dc8ec680a0c98c907656bd970675950000000000000000000000000000000000000000000000000000000767954a79", Some("latest".to_string())), |sigs| {
+            assert_eq!(sigs[0], "func_2093253501(bytes)".to_string());
+        }).await;
 
-        let sigs = fourbyte_possible_sigs("0xa9059cbb0000000000000000000000000a2ac0c368dc8ec680a0c98c907656bd970675950000000000000000000000000000000000000000000000000000000767954a79", Some("145".to_string())).await.unwrap();
-        assert_eq!(sigs[0], "transfer(address,uint256)".to_string());
+        test_if_fourbyte_not_down( fourbyte_possible_sigs("0xa9059cbb0000000000000000000000000a2ac0c368dc8ec680a0c98c907656bd970675950000000000000000000000000000000000000000000000000000000767954a79", Some("145".to_string())), |sigs| {
+            assert_eq!(sigs[0], "transfer(address,uint256)".to_string());
+        }).await;
     }
 
     #[tokio::test]
     async fn test_fourbyte_event() {
-        let sigs =
-            fourbyte_event("0x7e1db2a1cd12f0506ecd806dba508035b290666b84b096a87af2fd2a1516ede6")
-                .await
-                .unwrap();
-        assert_eq!(sigs[0].0, "updateAuthority(address,uint8)".to_string());
-        assert_eq!(sigs[0].1, 79573);
+        test_if_fourbyte_not_down(
+            fourbyte_event("0x7e1db2a1cd12f0506ecd806dba508035b290666b84b096a87af2fd2a1516ede6"),
+            |sigs| {
+                assert_eq!(sigs[0].0, "updateAuthority(address,uint8)".to_string());
+                assert_eq!(sigs[0].1, 79573);
+            },
+        )
+        .await;
 
-        let sigs =
-            fourbyte_event("0xb7009613e63fb13fd59a2fa4c206a992c1f090a44e5d530be255aa17fed0b3dd")
-                .await
-                .unwrap();
-        assert_eq!(sigs[0].0, "canCall(address,address,bytes4)".to_string());
+        test_if_fourbyte_not_down(
+            fourbyte_event("0xb7009613e63fb13fd59a2fa4c206a992c1f090a44e5d530be255aa17fed0b3dd"),
+            |sigs| {
+                assert_eq!(sigs[0].0, "canCall(address,address,bytes4)".to_string());
+            },
+        )
+        .await;
     }
 
     #[test]

@@ -1,5 +1,4 @@
 //! Contains various tests for checking forge's commands
-use ansi_term::Colour;
 use ethers::solc::{
     artifacts::{BytecodeHash, Metadata},
     ConfigurableContractArtifact,
@@ -9,8 +8,9 @@ use foundry_cli_test_utils::{
     forgetest, forgetest_ignore, forgetest_init,
     util::{pretty_err, read_string, TestCommand, TestProject},
 };
-use foundry_config::{parse_with_profile, BasicConfig, Config, SolidityErrorCode};
+use foundry_config::{parse_with_profile, BasicConfig, Chain, Config, SolidityErrorCode};
 use std::{env, fs};
+use yansi::Paint;
 
 // import forge utils as mod
 #[allow(unused)]
@@ -28,6 +28,50 @@ forgetest!(can_clean_non_existing, |prj: TestProject, mut cmd: TestCommand| {
     cmd.arg("clean");
     cmd.assert_empty_stdout();
     prj.assert_cleaned();
+});
+
+// checks that `cache clean` can be invoked and cleans the foundry cache
+// this test is not isolated and modifies ~ so it is ignored
+forgetest_ignore!(can_cache_clean, |_: TestProject, mut cmd: TestCommand| {
+    let cache_dir = Config::foundry_cache_dir().unwrap();
+    let path = cache_dir.as_path();
+    fs::create_dir_all(path).unwrap();
+    cmd.args(["cache", "clean"]);
+    cmd.assert_empty_stdout();
+
+    assert!(!path.exists());
+});
+
+// checks that `cache clean <chain>` can be invoked and cleans the chain cache
+// this test is not isolated and modifies ~ so it is ignored
+forgetest_ignore!(can_cache_clean_chain, |_: TestProject, mut cmd: TestCommand| {
+    let cache_dir =
+        Config::foundry_chain_cache_dir(Chain::Named(ethers::prelude::Chain::Mainnet)).unwrap();
+    let path = cache_dir.as_path();
+    fs::create_dir_all(path).unwrap();
+    cmd.args(["cache", "clean", "mainnet"]);
+    cmd.assert_empty_stdout();
+
+    assert!(!path.exists());
+});
+
+// checks that `cache clean <chain> --blocks 100,101` can be invoked and cleans the chain block
+// caches this test is not isolated and modifies ~ so it is ignored
+forgetest_ignore!(can_cache_clean_blocks, |_: TestProject, mut cmd: TestCommand| {
+    let chain = Chain::Named(ethers::prelude::Chain::Mainnet);
+    let block1 = 100;
+    let block2 = 102;
+    let block1_cache_dir = Config::foundry_block_cache_dir(chain, block1).unwrap();
+    let block2_cache_dir = Config::foundry_block_cache_dir(chain, block2).unwrap();
+    let block1_path = block1_cache_dir.as_path();
+    let block2_path = block2_cache_dir.as_path();
+    fs::create_dir_all(block1_path).unwrap();
+    fs::create_dir_all(block2_path).unwrap();
+    cmd.args(["cache", "clean", "mainnet", "--blocks", "100,101"]);
+    cmd.assert_empty_stdout();
+
+    assert!(!block1_path.exists());
+    assert!(!block2_path.exists());
 });
 
 // checks that init works
@@ -83,8 +127,8 @@ forgetest!(can_init_no_git, |prj: TestProject, mut cmd: TestCommand| {
     prj.assert_config_exists();
 
     assert!(!prj.root().join(".git").exists());
-    assert!(prj.root().join("lib/ds-test").exists());
-    assert!(!prj.root().join("lib/ds-test/.git").exists());
+    assert!(prj.root().join("lib/forge-std").exists());
+    assert!(!prj.root().join("lib/forge-std/.git").exists());
 });
 
 // Checks that quiet mode does not print anything
@@ -104,7 +148,7 @@ forgetest!(can_init_non_empty, |prj: TestProject, mut cmd: TestCommand| {
     cmd.arg("--force");
     cmd.assert_non_empty_stdout();
     assert!(prj.root().join(".git").exists());
-    assert!(prj.root().join("lib/ds-test").exists());
+    assert!(prj.root().join("lib/forge-std").exists());
 });
 
 // Checks that remappings.txt and .vscode/settings.json is generated
@@ -128,7 +172,7 @@ forgetest!(can_init_vscode, |prj: TestProject, mut cmd: TestCommand| {
     let remappings = prj.root().join("remappings.txt");
     assert!(remappings.is_file());
     let content = std::fs::read_to_string(remappings).unwrap();
-    assert_eq!(content, "ds-test/=lib/ds-test/src/");
+    assert_eq!(content, "ds-test/=lib/forge-std/lib/ds-test/src/\nforge-std/=lib/forge-std/src/");
 });
 
 // checks that `clean` removes dapptools style paths
@@ -184,6 +228,41 @@ forgetest_init!(can_emit_extra_output, |prj: TestProject, mut cmd: TestCommand| 
     let _artifact: Metadata = ethers::solc::utils::read_json_file(metadata_path).unwrap();
 });
 
+// checks that extra output works
+forgetest_init!(can_emit_multiple_extra_output, |prj: TestProject, mut cmd: TestCommand| {
+    cmd.set_current_dir(prj.root());
+    cmd.args(["build", "--extra-output", "metadata", "ir-optimized", "--extra-output", "ir"]);
+    cmd.assert_non_empty_stdout();
+
+    let artifact_path = prj.paths().artifacts.join("Contract.sol/Contract.json");
+    let artifact: ConfigurableContractArtifact =
+        ethers::solc::utils::read_json_file(artifact_path).unwrap();
+    assert!(artifact.metadata.is_some());
+    assert!(artifact.ir.is_some());
+    assert!(artifact.ir_optimized.is_some());
+
+    cmd.forge_fuse()
+        .args([
+            "build",
+            "--extra-output-files",
+            "metadata",
+            "ir-optimized",
+            "evm.bytecode.sourceMap",
+            "--force",
+        ])
+        .root_arg();
+    cmd.assert_non_empty_stdout();
+
+    let metadata_path = prj.paths().artifacts.join("Contract.sol/Contract.metadata.json");
+    let _artifact: Metadata = ethers::solc::utils::read_json_file(metadata_path).unwrap();
+
+    let iropt = prj.paths().artifacts.join("Contract.sol/Contract.iropt");
+    std::fs::read_to_string(iropt).unwrap();
+
+    let sourcemap = prj.paths().artifacts.join("Contract.sol/Contract.sourcemap");
+    std::fs::read_to_string(sourcemap).unwrap();
+});
+
 forgetest!(can_print_warnings, |prj: TestProject, mut cmd: TestCommand| {
     prj.inner()
         .add_source(
@@ -210,7 +289,7 @@ contract Greeter {
     assert!(output.contains(
         "
 Compiler run successful (with warnings)
-Warning: Unused function parameter. Remove or comment out the variable name to silence this warning.
+warning[5667]: Warning: Unused function parameter. Remove or comment out the variable name to silence this warning.
 ",
     ));
 });
@@ -290,10 +369,11 @@ contract Demo {
         "Compiler run successful
 {}
 Gas used: 1751
+== Return ==
 == Logs ==
   script ran
 ",
-        Colour::Green.paint("Script ran successfully.")
+        Paint::green("Script ran successfully.")
     ),));
 });
 
@@ -322,10 +402,11 @@ contract Demo {
         "Compiler run successful
 {}
 Gas used: 1751
+== Return ==
 == Logs ==
   script ran
 ",
-        Colour::Green.paint("Script ran successfully.")
+        Paint::green("Script ran successfully.")
     ),));
 });
 
@@ -357,13 +438,48 @@ contract Demo {
         "Compiler run successful
 {}
 Gas used: 3957
+== Return ==
 == Logs ==
   script ran
   1
   2
 ",
-        Colour::Green.paint("Script ran successfully.")
+        Paint::green("Script ran successfully.")
     ),));
+});
+
+// Tests that the run command can run functions with return values
+forgetest!(can_execute_run_command_with_returned, |prj: TestProject, mut cmd: TestCommand| {
+    let script = prj
+        .inner()
+        .add_source(
+            "Foo",
+            r#"
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.10;
+contract Demo {
+    event log_string(string);
+    function run() external returns (uint256 result, uint8) {
+        emit log_string("script ran");
+        return (255, 3);
+    }
+}"#,
+        )
+        .unwrap();
+    cmd.arg("run").arg(script);
+    let output = cmd.stdout_lossy();
+    assert!(output.ends_with(&format!(
+        "Compiler run successful
+{}
+Gas used: 1836
+== Return ==
+result: uint256 255
+1: uint8 3
+== Logs ==
+  script ran
+",
+        Paint::green("Script ran successfully.")
+    )));
 });
 
 // tests that the `inspect` command works correctly
@@ -518,4 +634,103 @@ forgetest_ignore!(can_compile_local_spells, |_: TestProject, mut cmd: TestComman
         "-vvv",
     ]);
     cmd.print_output();
+});
+
+// test that a failing `forge build` does not impact followup builds
+forgetest!(can_build_after_failure, |prj: TestProject, mut cmd: TestCommand| {
+    prj.insert_ds_test();
+
+    prj.inner()
+        .add_source(
+            "ATest.t.sol",
+            r#"
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.10;
+import "./test.sol";
+contract ATest is DSTest {
+    function testExample() public {
+        assertTrue(true);
+    }
+}
+   "#,
+        )
+        .unwrap();
+    prj.inner()
+        .add_source(
+            "BTest.t.sol",
+            r#"
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.10;
+import "./test.sol";
+contract BTest is DSTest {
+    function testExample() public {
+        assertTrue(true);
+    }
+}
+   "#,
+        )
+        .unwrap();
+
+    cmd.arg("build");
+    cmd.assert_non_empty_stdout();
+    prj.assert_cache_exists();
+    prj.assert_artifacts_dir_exists();
+
+    let syntax_err = r#"
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.10;
+import "./test.sol";
+contract CTest is DSTest {
+    function testExample() public {
+        THIS WILL CAUSE AN ERROR
+    }
+}
+   "#;
+
+    // introduce contract with syntax error
+    prj.inner().add_source("CTest.t.sol", syntax_err).unwrap();
+
+    // `forge build --force` which should fail
+    cmd.arg("--force");
+    cmd.assert_err();
+
+    // but ensure this cleaned cache and artifacts
+    assert!(!prj.paths().artifacts.exists());
+    assert!(!prj.cache_path().exists());
+
+    // still errors
+    cmd.forge_fuse().arg("build");
+    cmd.assert_err();
+
+    // resolve the error by replacing the file
+    prj.inner()
+        .add_source(
+            "CTest.t.sol",
+            r#"
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.10;
+import "./test.sol";
+contract CTest is DSTest {
+    function testExample() public {
+         assertTrue(true);
+    }
+}
+   "#,
+        )
+        .unwrap();
+
+    cmd.assert_non_empty_stdout();
+    prj.assert_cache_exists();
+    prj.assert_artifacts_dir_exists();
+
+    // ensure cache is unchanged after error
+    let cache = fs::read_to_string(prj.cache_path()).unwrap();
+
+    // introduce the error again but building without force
+    prj.inner().add_source("CTest.t.sol", syntax_err).unwrap();
+    cmd.assert_err();
+
+    // ensure unchanged cache file
+    let cache_after = fs::read_to_string(prj.cache_path()).unwrap();
+    assert_eq!(cache, cache_after);
 });

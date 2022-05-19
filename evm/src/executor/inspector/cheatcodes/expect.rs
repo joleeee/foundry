@@ -1,9 +1,11 @@
+use std::cmp::Ordering;
+
 use super::Cheatcodes;
 use crate::abi::HEVMCalls;
 use bytes::Bytes;
 use ethers::{
     abi::{AbiEncode, RawLog},
-    types::{Address, H160},
+    types::{Address, H160, U256},
 };
 use revm::{return_ok, Database, EVMData, Return};
 
@@ -114,11 +116,13 @@ pub struct ExpectedEmit {
     /// │topic 1│topic 2│topic 3│data│
     /// └───────┴───────┴───────┴────┘
     pub checks: [bool; 4],
+    /// If present, check originating address against this
+    pub address: Option<Address>,
     /// Whether the log was actually found in the subcalls
     pub found: bool,
 }
 
-pub fn handle_expect_emit(state: &mut Cheatcodes, log: RawLog) {
+pub fn handle_expect_emit(state: &mut Cheatcodes, log: RawLog, address: &Address) {
     // Fill or check the expected emits
     if let Some(next_expect_to_fill) =
         state.expected_emits.iter_mut().find(|expect| expect.log.is_none())
@@ -135,7 +139,8 @@ pub fn handle_expect_emit(state: &mut Cheatcodes, log: RawLog) {
             if expected.topics.len() != log.topics.len() {
                 next_expect.found = false;
             } else {
-                let topics_match = log
+                // Match topics
+                next_expect.found = log
                     .topics
                     .iter()
                     .skip(1)
@@ -143,14 +148,50 @@ pub fn handle_expect_emit(state: &mut Cheatcodes, log: RawLog) {
                     .filter(|(i, _)| next_expect.checks[*i])
                     .all(|(i, topic)| topic == &expected.topics[i + 1]);
 
-                // Maybe check data
-                next_expect.found = if next_expect.checks[3] {
-                    expected.data == log.data && topics_match
-                } else {
-                    topics_match
-                };
+                // Maybe match source address
+                if let Some(addr) = next_expect.address {
+                    next_expect.found &= addr == *address;
+                }
+
+                // Maybe match data
+                if next_expect.checks[3] {
+                    next_expect.found &= expected.data == log.data;
+                }
             }
         }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ExpectedCallData {
+    /// The expected calldata
+    pub calldata: Bytes,
+    /// The expected value sent in the call
+    pub value: Option<U256>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MockCallDataContext {
+    /// The partial calldata to match for mock
+    pub calldata: Bytes,
+    /// The value to match for mock
+    pub value: Option<U256>,
+}
+
+impl Ord for MockCallDataContext {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Calldata matching is reversed to ensure that a tighter match is
+        // returned if an exact match is not found. In case, there is
+        // a partial match to calldata that is more specific than
+        // a match to a msg.value, then the more specific calldata takes
+        // precedence.
+        self.calldata.cmp(&other.calldata).reverse().then(self.value.cmp(&other.value).reverse())
+    }
+}
+
+impl PartialOrd for MockCallDataContext {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -167,7 +208,7 @@ pub fn apply<DB: Database>(
         HEVMCalls::ExpectRevert2(inner) => {
             expect_revert(state, inner.0.to_vec().into(), data.subroutine.depth())
         }
-        HEVMCalls::ExpectEmit(inner) => {
+        HEVMCalls::ExpectEmit0(inner) => {
             state.expected_emits.push(ExpectedEmit {
                 depth: data.subroutine.depth() - 1,
                 checks: [inner.0, inner.1, inner.2, inner.3],
@@ -175,16 +216,43 @@ pub fn apply<DB: Database>(
             });
             Ok(Bytes::new())
         }
-        HEVMCalls::ExpectCall(inner) => {
-            state.expected_calls.entry(inner.0).or_default().push(inner.1.to_vec().into());
+        HEVMCalls::ExpectEmit1(inner) => {
+            state.expected_emits.push(ExpectedEmit {
+                depth: data.subroutine.depth() - 1,
+                checks: [inner.0, inner.1, inner.2, inner.3],
+                address: Some(inner.4),
+                ..Default::default()
+            });
             Ok(Bytes::new())
         }
-        HEVMCalls::MockCall(inner) => {
+        HEVMCalls::ExpectCall0(inner) => {
             state
-                .mocked_calls
+                .expected_calls
                 .entry(inner.0)
                 .or_default()
-                .insert(inner.1.to_vec().into(), inner.2.to_vec().into());
+                .push(ExpectedCallData { calldata: inner.1.to_vec().into(), value: None });
+            Ok(Bytes::new())
+        }
+        HEVMCalls::ExpectCall1(inner) => {
+            state
+                .expected_calls
+                .entry(inner.0)
+                .or_default()
+                .push(ExpectedCallData { calldata: inner.2.to_vec().into(), value: Some(inner.1) });
+            Ok(Bytes::new())
+        }
+        HEVMCalls::MockCall0(inner) => {
+            state.mocked_calls.entry(inner.0).or_default().insert(
+                MockCallDataContext { calldata: inner.1.to_vec().into(), value: None },
+                inner.2.to_vec().into(),
+            );
+            Ok(Bytes::new())
+        }
+        HEVMCalls::MockCall1(inner) => {
+            state.mocked_calls.entry(inner.0).or_default().insert(
+                MockCallDataContext { calldata: inner.2.to_vec().into(), value: Some(inner.1) },
+                inner.3.to_vec().into(),
+            );
             Ok(Bytes::new())
         }
         HEVMCalls::ClearMockedCalls(_) => {

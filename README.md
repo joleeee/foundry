@@ -21,6 +21,7 @@ Foundry consists of:
   Dapptools).
 - [**Cast**](./cast): Swiss army knife for interacting with EVM smart contracts,
   sending transactions and getting chain data.
+- [**Anvil**](./anvil): local Ethereum node, akin to Ganache, Hardhat Network
 
 **Need help getting started with Foundry? Read the [📖 Foundry Book][foundry-book] (WIP)!**
 
@@ -138,7 +139,7 @@ You can also override parts of your configuration using `FOUNDRY_` or `DAPP_` pr
 
 `forge init` creates a basic, extendable `foundry.toml` file.
 
-To see the your current configuration, run `forge config`. To see only basic
+To see your current configuration, run `forge config`. To see only basic
 options (as set with `forge init`), run `forge config --basic`. This can be used
 to create a new `foundry.toml` file with `forge config --basic > foundry.toml`.
 

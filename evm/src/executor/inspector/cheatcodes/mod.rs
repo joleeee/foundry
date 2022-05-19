@@ -3,7 +3,7 @@ mod env;
 pub use env::{Prank, RecordAccess};
 /// Assertion helpers (such as `expectEmit`)
 mod expect;
-pub use expect::{ExpectedEmit, ExpectedRevert};
+pub use expect::{ExpectedCallData, ExpectedEmit, ExpectedRevert, MockCallDataContext};
 /// Cheatcodes that interact with the external environment (FFI etc.)
 mod ext;
 /// Cheatcodes that configure the fuzzer
@@ -19,7 +19,7 @@ use crate::{
 use bytes::Bytes;
 use ethers::{
     abi::{AbiDecode, AbiEncode, RawLog},
-    types::{Address, H256},
+    types::{Address, H256, U256},
 };
 use revm::{
     opcode, BlockEnv, CallInputs, CreateInputs, Database, EVMData, Gas, Inspector, Interpreter,
@@ -42,6 +42,12 @@ pub struct Cheatcodes {
     /// execution block environment.
     pub block: Option<BlockEnv>,
 
+    /// The gas price
+    ///
+    /// Used in the cheatcode handler to overwrite the gas price separately from the gas price
+    /// in the execution environment.
+    pub gas_price: Option<U256>,
+
     /// Address labels
     pub labels: BTreeMap<Address, String>,
 
@@ -55,18 +61,18 @@ pub struct Cheatcodes {
     pub accesses: Option<RecordAccess>,
 
     /// Mocked calls
-    pub mocked_calls: BTreeMap<Address, BTreeMap<Bytes, Bytes>>,
+    pub mocked_calls: BTreeMap<Address, BTreeMap<MockCallDataContext, Bytes>>,
 
     /// Expected calls
-    pub expected_calls: BTreeMap<Address, Vec<Bytes>>,
+    pub expected_calls: BTreeMap<Address, Vec<ExpectedCallData>>,
 
     /// Expected emits
     pub expected_emits: Vec<ExpectedEmit>,
 }
 
 impl Cheatcodes {
-    pub fn new(ffi: bool, block: BlockEnv) -> Self {
-        Self { ffi, block: Some(block), ..Default::default() }
+    pub fn new(ffi: bool, block: BlockEnv, gas_price: U256) -> Self {
+        Self { ffi, block: Some(block), gas_price: Some(gas_price), ..Default::default() }
     }
 
     fn apply_cheatcode<DB: Database>(
@@ -107,7 +113,9 @@ where
             // Handle expected calls
             if let Some(expecteds) = self.expected_calls.get_mut(&call.contract) {
                 if let Some(found_match) = expecteds.iter().position(|expected| {
-                    expected.len() <= call.input.len() && expected == &call.input[..expected.len()]
+                    expected.calldata.len() <= call.input.len() &&
+                        expected.calldata == call.input[..expected.calldata.len()] &&
+                        expected.value.map(|value| value == call.transfer.value).unwrap_or(true)
                 }) {
                     expecteds.remove(found_match);
                 }
@@ -115,11 +123,16 @@ where
 
             // Handle mocked calls
             if let Some(mocks) = self.mocked_calls.get(&call.contract) {
-                if let Some(mock_retdata) = mocks.get(&call.input) {
+                let ctx = MockCallDataContext {
+                    calldata: call.input.clone(),
+                    value: Some(call.transfer.value),
+                };
+                if let Some(mock_retdata) = mocks.get(&ctx) {
                     return (Return::Return, Gas::new(call.gas_limit), mock_retdata.clone())
-                } else if let Some((_, mock_retdata)) =
-                    mocks.iter().find(|(mock, _)| *mock == &call.input[..mock.len()])
-                {
+                } else if let Some((_, mock_retdata)) = mocks.iter().find(|(mock, _)| {
+                    *mock.calldata == call.input[..mock.calldata.len()] &&
+                        mock.value.map(|value| value == call.transfer.value).unwrap_or(true)
+                }) {
                     return (Return::Return, Gas::new(call.gas_limit), mock_retdata.clone())
                 }
             }
@@ -159,6 +172,9 @@ where
         if let Some(block) = self.block.take() {
             data.env.block = block;
         }
+        if let Some(gas_price) = self.gas_price.take() {
+            data.env.tx.gas_price = gas_price;
+        }
 
         Return::Continue
     }
@@ -197,10 +213,14 @@ where
         Return::Continue
     }
 
-    fn log(&mut self, _: &mut EVMData<'_, DB>, _: &Address, topics: &[H256], data: &Bytes) {
+    fn log(&mut self, _: &mut EVMData<'_, DB>, address: &Address, topics: &[H256], data: &Bytes) {
         // Match logs if `expectEmit` has been called
         if !self.expected_emits.is_empty() {
-            handle_expect_emit(self, RawLog { topics: topics.to_vec(), data: data.to_vec() });
+            handle_expect_emit(
+                self,
+                RawLog { topics: topics.to_vec(), data: data.to_vec() },
+                address,
+            );
         }
     }
 
@@ -265,9 +285,10 @@ where
                     Return::Revert,
                     remaining_gas,
                     format!(
-                        "Expected a call to 0x{} with data {}, but got none",
+                        "Expected a call to {:?} with data {}{}, but got none",
                         address,
-                        ethers::types::Bytes::from(expecteds[0].clone())
+                        ethers::types::Bytes::from(expecteds[0].calldata.clone()),
+                        expecteds[0].value.map(|v| format!(" and value {}", v)).unwrap_or_default()
                     )
                     .encode()
                     .into(),

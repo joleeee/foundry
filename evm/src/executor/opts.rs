@@ -1,9 +1,12 @@
 use ethers::{
     providers::{Middleware, Provider},
+    solc::utils::RuntimeOrHandle,
     types::{Address, Chain, U256},
 };
 use revm::{BlockEnv, CfgEnv, SpecId, TxEnv};
 use serde::{Deserialize, Deserializer, Serialize};
+
+use foundry_common;
 
 use super::fork::environment;
 
@@ -63,7 +66,7 @@ impl EvmOpts {
                     gas_limit: self.gas_limit(),
                 },
                 cfg: CfgEnv {
-                    chain_id: self.env.chain_id.unwrap_or(99).into(),
+                    chain_id: self.env.chain_id.unwrap_or(foundry_common::DEV_CHAIN_ID).into(),
                     spec_id: SpecId::LONDON,
                     perf_all_precompiles_have_balance: false,
                     memory_limit: self.memory_limit,
@@ -78,6 +81,7 @@ impl EvmOpts {
         }
     }
 
+    /// Returns the gas limit to use
     pub fn gas_limit(&self) -> U256 {
         self.env.block_gas_limit.unwrap_or(self.env.gas_limit).into()
     }
@@ -104,7 +108,7 @@ impl EvmOpts {
             let provider = Provider::try_from(url.as_str())
                 .unwrap_or_else(|_| panic!("Failed to establish provider to {url}"));
 
-            if let Ok(id) = foundry_utils::RuntimeOrHandle::new().block_on(provider.get_chainid()) {
+            if let Ok(id) = RuntimeOrHandle::new().block_on(provider.get_chainid()) {
                 return Chain::try_from(id.as_u64()).ok()
             }
         }

@@ -8,6 +8,8 @@ interface Cheats {
     function roll(uint256) external;
     // Set block.basefee (newBasefee)
     function fee(uint256) external;
+    // Set block.coinbase (who)
+    function coinbase(address) external;
     // Loads a storage slot from an address (who, slot)
     function load(address,bytes32) external returns (bytes32);
     // Stores a value to an address' storage slot, (who, slot, value)
@@ -42,18 +44,25 @@ interface Cheats {
     function accesses(address) external returns (bytes32[] memory reads, bytes32[] memory writes);
     // Prepare an expected log with (bool checkTopic1, bool checkTopic2, bool checkTopic3, bool checkData).
     // Call this function, then emit an event, then call a function. Internally after the call, we check if
-    // logs were emitted in the expected order with the expected topics and data (as specified by the booleans)
+    // logs were emitted in the expected order with the expected topics and data (as specified by the booleans).
+    // Second form also checks supplied address against emitting contract.
     function expectEmit(bool,bool,bool,bool) external;
+    function expectEmit(bool,bool,bool,bool,address) external;
     // Mocks a call to an address, returning specified data.
     // Calldata can either be strict or a partial match, e.g. if you only
     // pass a Solidity selector to the expected calldata, then the entire Solidity
     // function will be mocked.
     function mockCall(address,bytes calldata,bytes calldata) external;
+    // Mocks a call to an address with a specific msg.value, returning specified data.
+    // Calldata match takes precedence over msg.value in case of ambiguity.
+    function mockCall(address,uint256,bytes calldata,bytes calldata) external;
     // Clears all mocked calls
     function clearMockedCalls() external;
     // Expect a call to an address with the specified calldata.
     // Calldata can either be strict or a partial match
     function expectCall(address,bytes calldata) external;
+    // Expect a call to an address with the specified msg.value and calldata
+    function expectCall(address,uint256,bytes calldata) external;
     // Gets the code from an artifact file. Takes in the relative path to the json file
     function getCode(string calldata) external returns (bytes memory);
     // Labels an address in call traces

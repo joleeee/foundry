@@ -24,6 +24,7 @@ use foundry_config::{
 };
 
 use serde::Serialize;
+use strum::VariantNames;
 
 const FLASHBOTS_URL: &str = "https://rpc.flashbots.net";
 
@@ -37,24 +38,8 @@ pub struct ClapChain {
         env = "CHAIN",
         default_value = "mainnet",
         // if Chain implemented ArgEnum, we'd get this for free
-        possible_values = [
-            "mainnet",
-            "ropsten",
-            "rinkeby",
-            "goerli",
-            "kovan",
-            "xdai",
-            "polygon",
-            "polygon_mumbai",
-            "avalanche",
-            "avalanche_fuji",
-            "sepolia",
-            "moonbeam",
-            "moonbeam_dev",
-            "moonriver",
-            "optimism",
-            "optimism-kovan"
-        ])]
+        possible_values = Chain::VARIANTS
+    )]
     pub inner: Chain,
 }
 

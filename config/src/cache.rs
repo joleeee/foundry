@@ -1,8 +1,9 @@
 //! Support types for configuring storage caching
 
 use crate::chain::Chain;
+use number_prefix::NumberPrefix;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::{fmt, str::FromStr};
+use std::{fmt, fmt::Formatter, str::FromStr};
 
 /// Settings to configure caching of remote
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -21,8 +22,8 @@ impl StorageCachingConfig {
 
     /// Whether caching should be enabled for the chain id
     pub fn enable_for_chain_id(&self, chain_id: u64) -> bool {
-        // ignore dev chain
-        if chain_id == 1337 {
+        // ignore dev chains
+        if [99, 1337, 31337].contains(&chain_id) {
             return false
         }
         self.chains.is_match(chain_id)
@@ -180,6 +181,49 @@ impl Serialize for CachedEndpoints {
             CachedEndpoints::Pattern(pattern) => serializer.serialize_str(pattern.as_str()),
         }
     }
+}
+
+/// Content of the foundry cache folder
+#[derive(Debug, Default)]
+pub struct Cache {
+    /// The list of chains in the cache
+    pub chains: Vec<ChainCache>,
+}
+
+impl fmt::Display for Cache {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        for chain in &self.chains {
+            match NumberPrefix::decimal(chain.blocks.iter().map(|x| x.1).sum::<u64>() as f32) {
+                NumberPrefix::Standalone(size) => {
+                    writeln!(f, "-️ {} ({:.1} B)", chain.name, size)?;
+                }
+                NumberPrefix::Prefixed(prefix, size) => {
+                    writeln!(f, "-️ {} ({:.1} {}B)", chain.name, size, prefix)?;
+                }
+            }
+            for block in &chain.blocks {
+                match NumberPrefix::decimal(block.1 as f32) {
+                    NumberPrefix::Standalone(size) => {
+                        writeln!(f, "\t-️ Block {} ({:.1} B)", block.0, size)?;
+                    }
+                    NumberPrefix::Prefixed(prefix, size) => {
+                        writeln!(f, "\t-️ Block {} ({:.1} {}B)", block.0, size, prefix)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A chain folder in the foundry cache
+#[derive(Debug)]
+pub struct ChainCache {
+    /// The name of the chain
+    pub name: String,
+
+    /// A tuple containing block number and the block directory size in bytes
+    pub blocks: Vec<(String, u64)>,
 }
 
 #[cfg(test)]

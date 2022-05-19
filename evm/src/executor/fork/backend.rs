@@ -37,9 +37,14 @@ enum ProviderRequest<Err> {
 /// The Request type the Backend listens for
 #[derive(Debug)]
 enum BackendRequest {
+    /// Fetch the account info
     Basic(Address, OneshotSender<AccountInfo>),
+    /// Fetch a storage slot
     Storage(Address, U256, OneshotSender<U256>),
+    /// Fetch a block hash
     BlockHash(u64, OneshotSender<H256>),
+    /// Sets the pinned block to fetch data from
+    SetPinnedBlock(BlockId),
 }
 
 /// Handles an internal provider and listens for requests.
@@ -47,7 +52,7 @@ enum BackendRequest {
 /// This handler will remain active as long as it is reachable (request channel still open) and
 /// requests are in progress.
 #[must_use = "BackendHandler does nothing unless polled."]
-struct BackendHandler<M: Middleware> {
+pub struct BackendHandler<M: Middleware> {
     provider: M,
     /// Stores all the data.
     db: BlockchainDb,
@@ -136,6 +141,9 @@ where
                     // account present but not storage -> fetch storage
                     self.request_account_storage(addr, idx, sender);
                 }
+            }
+            BackendRequest::SetPinnedBlock(block_id) => {
+                self.block_id = Some(block_id);
             }
         }
     }
@@ -232,7 +240,6 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let pin = self.get_mut();
-
         loop {
             // Drain queued requests first.
             while let Some(req) = pin.queued_requests.pop_front() {
@@ -249,7 +256,7 @@ where
                         trace!(target: "backendhandler", "last sender dropped, ready to drop (&flush cache)");
                         return Poll::Ready(())
                     }
-                    _ => break,
+                    Poll::Pending => break,
                 }
             }
 
@@ -268,7 +275,7 @@ where
                             let (code, code_hash) = if !code.0.is_empty() {
                                 (Some(code.0.clone()), keccak256(&code).into())
                             } else {
-                                (None, KECCAK_EMPTY)
+                                (Some(bytes::Bytes::default()), KECCAK_EMPTY)
                             };
 
                             // update the cache
@@ -345,9 +352,9 @@ impl<M: Middleware> Drop for BackendHandler<M> {
 
 /// A cloneable backend type that shares access to the backend data with all its clones.
 ///
-/// This backend type is connected to the `BackendHandler` via a mpsc channel. The `BackendHandlers`
-/// is spawned on a background thread and listens for incoming commands on the receiver half of the
-/// channel. A `SharedBackend` holds a sender for that channel, which is `Clone`, so their can be
+/// This backend type is connected to the `BackendHandler` via a mpsc channel. The `BackendHandler`
+/// is spawned on a tokio task and listens for incoming commands on the receiver half of the
+/// channel. A `SharedBackend` holds a sender for that channel, which is `Clone`, so there can be
 /// multiple `SharedBackend`s communicating with the same `BackendHandler`, hence this `Backend`
 /// type is thread safe.
 ///
@@ -365,6 +372,12 @@ impl<M: Middleware> Drop for BackendHandler<M> {
 /// from `B` and simply adds it as an additional listener for the request already in progress,
 /// instead of sending another one. So that after the provider returns the response all listeners
 /// (`A` and `B`) get notified.
+// **Note**: the implementation makes use of [tokio::task::block_in_place()] when interacting with
+// the underlying [BackendHandler] which runs on a separate spawned tokio task.
+// [tokio::task::block_in_place()]
+// > Runs the provided blocking function on the current thread without blocking the executor.
+// This prevents issues (hangs) we ran into were the [SharedBackend] itself is called from a spawned
+// task.
 #[derive(Debug, Clone)]
 pub struct SharedBackend {
     /// channel used for sending commands related to database operations
@@ -383,39 +396,66 @@ impl SharedBackend {
     where
         M: Middleware + Unpin + 'static + Clone,
     {
-        let (backend, backend_rx) = channel(1);
-        let handler = BackendHandler::new(provider, db, backend_rx, pin_block);
+        let (shared, handler) = Self::new(provider, db, pin_block);
         // spawn the provider handler to background
         trace!(target: "backendhandler", "spawning Backendhandler");
         tokio::spawn(handler);
+        shared
+    }
 
-        Self { backend }
+    /// Returns a new `SharedBackend` and the `BackendHandler`
+    pub fn new<M>(
+        provider: M,
+        db: BlockchainDb,
+        pin_block: Option<BlockId>,
+    ) -> (Self, BackendHandler<M>)
+    where
+        M: Middleware + Unpin + 'static + Clone,
+    {
+        let (backend, backend_rx) = channel(1);
+        let handler = BackendHandler::new(provider, db, backend_rx, pin_block);
+        (Self { backend }, handler)
+    }
+
+    /// Updates the pinned block to fetch data from
+    pub fn set_pinned_block(&self, block: impl Into<BlockId>) -> eyre::Result<()> {
+        tokio::task::block_in_place(|| {
+            let req = BackendRequest::SetPinnedBlock(block.into());
+            self.backend.clone().try_send(req).map_err(|e| eyre::eyre!("{:?}", e))
+        })
     }
 
     fn do_get_basic(&self, address: Address) -> eyre::Result<AccountInfo> {
-        let (sender, rx) = oneshot_channel();
-        let req = BackendRequest::Basic(address, sender);
-        self.backend.clone().try_send(req).map_err(|e| eyre::eyre!("{:?}", e))?;
-        Ok(rx.recv()?)
+        tokio::task::block_in_place(|| {
+            let (sender, rx) = oneshot_channel();
+            let req = BackendRequest::Basic(address, sender);
+            self.backend.clone().try_send(req).map_err(|e| eyre::eyre!("{:?}", e))?;
+            Ok(rx.recv()?)
+        })
     }
 
     fn do_get_storage(&self, address: Address, index: U256) -> eyre::Result<U256> {
-        let (sender, rx) = oneshot_channel();
-        let req = BackendRequest::Storage(address, index, sender);
-        self.backend.clone().try_send(req).map_err(|e| eyre::eyre!("{:?}", e))?;
-        Ok(rx.recv()?)
+        tokio::task::block_in_place(|| {
+            let (sender, rx) = oneshot_channel();
+            let req = BackendRequest::Storage(address, index, sender);
+            self.backend.clone().try_send(req).map_err(|e| eyre::eyre!("{:?}", e))?;
+            Ok(rx.recv()?)
+        })
     }
 
     fn do_get_block_hash(&self, number: u64) -> eyre::Result<H256> {
-        let (sender, rx) = oneshot_channel();
-        let req = BackendRequest::BlockHash(number, sender);
-        self.backend.clone().try_send(req).map_err(|e| eyre::eyre!("{:?}", e))?;
-        Ok(rx.recv()?)
+        tokio::task::block_in_place(|| {
+            let (sender, rx) = oneshot_channel();
+            let req = BackendRequest::BlockHash(number, sender);
+            self.backend.clone().try_send(req).map_err(|e| eyre::eyre!("{:?}", e))?;
+            Ok(rx.recv()?)
+        })
     }
 }
 
 impl DatabaseRef for SharedBackend {
     fn basic(&self, address: H160) -> AccountInfo {
+        trace!( target: "sharedbackend", "request basic {:?}", address);
         self.do_get_basic(address).unwrap_or_else(|_| {
             warn!( target: "sharedbackend", "Failed to send/recv `basic` for {}", address);
             Default::default()
@@ -427,6 +467,7 @@ impl DatabaseRef for SharedBackend {
     }
 
     fn storage(&self, address: H160, index: U256) -> U256 {
+        trace!( target: "sharedbackend", "request storage {:?} at {:?}", address, index);
         self.do_get_storage(address, index)
             .unwrap_or_else(|_| {
             warn!( target: "sharedbackend", "Failed to send/recv `storage` for {} at {}", address, index);
@@ -439,6 +480,7 @@ impl DatabaseRef for SharedBackend {
             return KECCAK_EMPTY
         }
         let number = number.as_u64();
+        trace!( target: "sharedbackend", "request block hash for number {:?}", number);
         self.do_get_block_hash(number).unwrap_or_else(|_| {
             warn!( target: "sharedbackend", "Failed to send/recv `block_hash` for {}", number);
             Default::default()
@@ -454,9 +496,9 @@ mod tests {
     };
     use ethers::{
         providers::{Http, Provider},
+        solc::utils::RuntimeOrHandle,
         types::Address,
     };
-    use foundry_utils::RuntimeOrHandle;
 
     use std::{collections::BTreeSet, convert::TryFrom, path::PathBuf, sync::Arc};
 

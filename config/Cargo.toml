@@ -6,21 +6,27 @@ license = "MIT OR Apache-2.0"
 description = """
 Foundry configuration
 """
-repository = "https://github.com/gakonst/foundry"
+repository = "https://github.com/foundry-rs/foundry"
 readme = "README.md"
 
 [dependencies]
 dirs-next = "2.0.0"
 semver = { version = "1.0.5", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_regex = "1.1.0"
 toml = "0.5"
 figment = { version = "0.10", features = ["toml", "env"] }
 eyre = "0.6.5"
 ethers-core = { git = "https://github.com/gakonst/ethers-rs", default-features = false }
 ethers-solc = { git = "https://github.com/gakonst/ethers-rs", default-features = false, features = ["async", "svm-solc"] }
 Inflector = "0.11.4"
+number_prefix = "0.4.0"
 regex = "1.5.5"
+globset = "0.4.8"
+walkdir = "2.3.2"
+toml_edit = "0.14.3"
 
 [dev-dependencies]
 pretty_assertions = "1.0.0"
 figment = { version = "0.10", features = ["test"] }
+tempfile = "3.3.0"

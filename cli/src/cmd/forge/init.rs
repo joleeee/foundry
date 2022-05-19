@@ -9,7 +9,7 @@ use clap::{Parser, ValueHint};
 use foundry_config::Config;
 
 use crate::cmd::forge::{install::DependencyInstallOpts, remappings};
-use ansi_term::Colour;
+use yansi::Paint;
 
 use std::{
     path::{Path, PathBuf},
@@ -88,7 +88,7 @@ impl Cmd for InitArgs {
                     r#"{}: `forge init` cannot be run on a non-empty directory.
 
         run `forge init --force` to initialize regardless."#,
-                    Colour::Red.paint("error")
+                    Paint::red("error")
                 );
                 std::process::exit(1);
             }
@@ -124,11 +124,11 @@ impl Cmd for InitArgs {
             if !offline {
                 let opts = DependencyInstallOpts { no_git, no_commit, quiet };
 
-                if root.join("lib/ds-test").exists() {
-                    println!("\"lib/ds-test\" already exists, skipping install....");
+                if root.join("lib/forge-std").exists() {
+                    println!("\"lib/forge-std\" already exists, skipping install....");
                     install(&root, vec![], opts)?;
                 } else {
-                    Dependency::from_str("https://github.com/dapphub/ds-test")
+                    Dependency::from_str("https://github.com/foundry-rs/forge-std")
                         .and_then(|dependency| install(&root, vec![dependency], opts))?;
                 }
             }
@@ -138,7 +138,7 @@ impl Cmd for InitArgs {
             }
         }
 
-        p_println!(!quiet => "    {} forge project.",   Colour::Green.paint("Initialized"));
+        p_println!(!quiet => "    {} forge project.",   Paint::green("Initialized"));
         Ok(())
     }
 }
@@ -190,10 +190,11 @@ fn init_git_repo(root: &Path, no_commit: bool) -> eyre::Result<()> {
 fn init_vscode(root: &Path) -> eyre::Result<()> {
     let remappings_file = root.join("remappings.txt");
     if !remappings_file.exists() {
-        let remappings = remappings::relative_remappings(&root.join("lib"), root)
+        let mut remappings = remappings::relative_remappings(&root.join("lib"), root)
             .into_iter()
             .map(|r| r.to_string())
             .collect::<Vec<_>>();
+        remappings.sort();
         if !remappings.is_empty() {
             let content = remappings.join("\n");
             std::fs::write(remappings_file, content)?;
