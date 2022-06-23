@@ -81,7 +81,7 @@ where
         block: Option<BlockId>,
     ) -> Result<String> {
         let (tx, func) = builder_output;
-        let res = self.provider.call(&tx, block, None).await?;
+        let res = self.provider.call(&tx, block).await?;
 
         // decode args into tokens
         let func = func.expect("no valid function signature was provided.");
